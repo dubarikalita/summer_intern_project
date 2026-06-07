@@ -9,13 +9,6 @@ A deep learning based automatic modulation classification (AMC) system built on 
 **RadioML2016.10a** — Download from Kaggle:
 https://www.kaggle.com/datasets/nolasthitnotomorrow/radioml2016-deepsigcom/data
 
-Download `RML2016.10a_dict.pkl` and place it in the `dataset/` folder:
-```
-mvp/
-└── dataset/
-    └── RML2016.10a_dict.pkl
-```
-
 The dataset contains:
 - **11 modulation classes** — 8PSK, AM-DSB, AM-SSB, BPSK, CPFSK, GFSK, PAM4, QAM16, QAM64, QPSK, WBFM
 - **20 SNR levels** — from -20 dB to +18 dB (step of 2)
