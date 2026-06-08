@@ -42,8 +42,8 @@ The dataset contains:
 
 **Step 1 — Clone the repo**
 ```bash
-git clone https://github.com/YOUR_USERNAME/amc-mvp.git
-cd amc-mvp
+git clone https://github.com/YOUR_USERNAME/summer_intern_project.git
+cd summer_intern_project
 ```
 
 **Step 2 — Install dependencies**
