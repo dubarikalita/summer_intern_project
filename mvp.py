@@ -284,6 +284,317 @@ class _LSTMNet(nn.Module):
         return self.fc(last)        # (B, n_classes)
 
 
+# ─────────────────────────────────────────────
+#  SECTION 5 — ResNet + LSTM MODEL (Stage 5)
+#
+#  Motivation
+#  ----------
+#  Stage 4's plain LSTM reads raw I/Q samples one
+#  time-step at a time.  It can capture temporal
+#  patterns but struggles to learn *local* structure
+#  (e.g. symbol-level amplitude/phase patterns) before
+#  the sequence gets long.
+#
+#  Adding a stack of 1-D residual convolutional blocks
+#  in front of the LSTM lets the network first compress
+#  local features into richer per-step representations,
+#  then let the LSTM model how those features evolve
+#  across the full frame.
+#
+#  Full data flow
+#  --------------
+#  Input  (N, 2, 128)   — raw I/Q, channels-first for Conv1d
+#    ↓  Stem conv       — projects 2 raw channels → 64 feature maps
+#    ↓  ResBlock × 3    — refines local features; skip connections
+#                          prevent gradient vanishing in the conv stack
+#    ↓  permute(0,2,1)  — reshape to (N, 128, 64) for LSTM's
+#                          (batch, seq_len, features) convention
+#    ↓  Stacked LSTM    — 2 layers, hidden=128; models temporal
+#                          dependencies across the 128-step sequence
+#    ↓  last step only  — (N, 128); discards intermediate hidden states
+#    ↓  Linear FC       — (128 → n_classes); final classification head
+#  Output (N, n_classes) — raw logits fed to CrossEntropyLoss
+# ─────────────────────────────────────────────
+
+
+class ResidualBlock1D(nn.Module):
+    """
+    One residual block operating on 1-D feature sequences.
+
+    Structure (classic pre-activation layout without pre-activation here):
+        x ──► Conv1d ──► BN ──► ReLU ──► Conv1d ──► BN ──► (+) ──► ReLU
+        └─────────────────────────────────────────────────────┘
+                              identity skip connection
+
+    Why residual / skip connections?
+    - Allow gradients to flow directly back to early layers,
+      sidestepping the vanishing-gradient problem that hurts
+      deep networks trained with SGD/Adam.
+    - The block learns a *residual* correction on top of its
+      own input rather than a full transformation from scratch,
+      which is easier to optimise.
+
+    Input/output shape: (N, channels, seq_len) — unchanged.
+    The number of channels stays constant so the identity skip
+    requires no projection (no 1×1 conv needed).
+    """
+
+    def __init__(self, channels):
+        super().__init__()
+
+        
+        self.conv1 = nn.Conv1d(
+            channels,
+            channels,
+            kernel_size=3,
+            padding=1,
+            bias=False,
+        )
+        self.bn1 = nn.BatchNorm1d(channels)
+        self.conv2 = nn.Conv1d(
+            channels,
+            channels,
+            kernel_size=3,
+            padding=1,
+            bias=False,
+        )
+
+        self.bn2 = nn.BatchNorm1d(channels)
+
+    def forward(self, x):
+        # Save input for the skip connection before any transformation.
+        identity = x
+
+        # First sub-layer: conv → normalise → activate
+        out = self.conv1(x)
+        out = self.bn1(out)
+        out = torch.relu(out)
+        out = self.conv2(out)
+        out = self.bn2(out)
+        out = out + identity
+        out = torch.relu(out)
+
+        return out
+
+
+class _ResNetLSTMNet(nn.Module):
+    """
+    Hybrid convolutional + recurrent classifier for I/Q signals.
+
+    Design rationale
+    ----------------
+    - Conv layers (stem + residual blocks) act as a *local feature extractor*:
+      they see a small window of time steps at once and learn patterns like
+      symbol transitions, amplitude modulation depth, and phase jumps.
+    - The LSTM acts as a *sequence model*: after the convs compress raw I/Q
+      into richer 64-dim per-step vectors, the LSTM integrates them across
+      the whole 128-step frame to capture global temporal structure.
+    - This two-stage design outperforms a plain LSTM (Stage 4) because the
+      LSTM no longer has to learn local structure from raw 2-dim I/Q; it
+      receives pre-processed 64-dim features instead.
+
+    Input shape  : (N, 2, 128)    — channels-first, as expected by Conv1d
+    Output shape : (N, n_classes) — unnormalised logits
+    """
+
+    def __init__(
+        self,
+        n_classes,
+        hidden_size=128,
+    ):
+        super().__init__()
+
+        self.stem = nn.Sequential(
+            nn.Conv1d(
+                2,          # in_channels  : I and Q
+                64,         # out_channels : learned feature maps
+                kernel_size=3,
+                padding=1,  # same-padding preserves seq_len=128
+                bias=False,
+            ),
+            nn.BatchNorm1d(64),
+            nn.ReLU(),
+        )
+
+        self.res1 = ResidualBlock1D(64)
+        self.res2 = ResidualBlock1D(64)
+        self.res3 = ResidualBlock1D(64)
+        self.lstm = nn.LSTM(
+            input_size=64,
+            hidden_size=hidden_size,
+            num_layers=2,
+            batch_first=True,
+            dropout=0.5,
+        )
+        self.fc = nn.Linear(
+            hidden_size,
+            n_classes,
+        )
+
+    def forward(self, x):
+      
+        x = self.stem(x)
+        # Three residual blocks refine the feature maps without changing
+        # shape.  Each block's skip connection ensures gradients backprop
+        # cleanly all the way to the stem.
+        x = self.res1(x)    # (N, 64, 128)
+        x = self.res2(x)    # (N, 64, 128)
+        x = self.res3(x)    # (N, 64, 128)
+        x = x.permute(0, 2, 1)
+        out, _ = self.lstm(x)
+        last = out[:, -1, :]    # (N, hidden_size)
+        return self.fc(last)    # (N, n_classes)
+
+
+class ResNetLSTMClassifier:
+    """
+    Sklearn-style wrapper around _ResNetLSTMNet.
+
+    Exposes .fit(x, y) and .predict(x) so it plugs into the same
+    evaluate() function used by Stages 1–4.
+
+    Training details
+    ----------------
+    - Loss    : CrossEntropyLoss (softmax + NLL in one numerically
+                stable op)
+    - Optimiser: Adam with lr=1e-3 (adaptive per-parameter learning
+                rates; well suited to the mixed conv+LSTM parameter
+                landscape)
+    - Epochs  : 30 by default; early stopping not used here — keep it
+                simple for benchmarking
+    - Batch size: 256 — large enough for stable BN statistics while
+                fitting comfortably in GPU memory
+    """
+
+    def __init__(
+        self,
+        hidden_size=128,
+        epochs=30,
+        batch_size=256,
+        lr=1e-3,
+        seed=42,
+    ):
+        self.hidden_size = hidden_size
+        self.epochs = epochs
+        self.batch_size = batch_size
+        self.lr = lr
+        self.seed = seed
+
+    def fit(self, x, y):
+        torch.manual_seed(self.seed)
+
+        self.device_ = _get_device()
+        x_t = torch.tensor(
+            x.astype(np.float32)
+        )
+
+        y_t = torch.tensor(
+            y,
+            dtype=torch.long
+        )
+
+        loader = DataLoader(
+            TensorDataset(x_t, y_t),
+            batch_size=self.batch_size,
+            shuffle=True,       # shuffle each epoch to reduce correlation
+            num_workers=0,      # 0 = load in the main process (safest on all OS)
+        )
+
+        n_classes = int(y.max()) + 1
+
+        self.model_ = _ResNetLSTMNet(
+            n_classes=n_classes,
+            hidden_size=self.hidden_size,
+        ).to(self.device_)
+
+        criterion = nn.CrossEntropyLoss()
+
+        optimizer = torch.optim.Adam(
+            self.model_.parameters(),
+            lr=self.lr,
+        )
+
+        self.model_.train()
+
+        for epoch in range(self.epochs):
+
+            total_loss = 0.0
+            correct = 0
+            total = 0
+
+            for xb, yb in loader:
+
+                xb = xb.to(self.device_)
+                yb = yb.to(self.device_)
+
+                optimizer.zero_grad()
+
+                # Forward pass: raw I/Q → conv stack → LSTM → logits
+                logits = self.model_(xb)
+
+                loss = criterion(
+                    logits,
+                    yb,
+                )
+
+                # Backward pass: autograd computes gradients through
+                # both the LSTM (via BPTT) and the conv blocks.
+                loss.backward()
+
+                optimizer.step()
+
+                total_loss += loss.item() * len(yb)
+
+                correct += (
+                    logits.argmax(1) == yb
+                ).sum().item()
+
+                total += len(yb)
+
+            print(
+                f"  ResNet+LSTM epoch {epoch+1:3d}/{self.epochs}"
+                f"  loss={total_loss/total:.4f}"
+                f"  train_acc={correct/total:.4f}",
+                flush=True,
+            )
+
+        return self
+
+    def predict(self, x):
+
+        self.model_.eval()  # disables dropout and switches BN to eval mode
+
+        x_t = torch.tensor(
+            x.astype(np.float32)
+        )
+
+        # Use a larger batch size at inference — no gradient storage needed,
+        # so memory is less constrained than during training.
+        loader = DataLoader(
+            TensorDataset(x_t),
+            batch_size=self.batch_size * 2,
+            shuffle=False,
+        )
+
+        preds = []
+
+        with torch.no_grad():   # disables autograd for faster, lighter inference
+
+            for (xb,) in loader:
+
+                xb = xb.to(self.device_)
+
+                pred = self.model_(xb)
+
+                preds.append(
+                    pred.argmax(1)
+                    .cpu()
+                    .numpy()
+                )
+
+        return np.concatenate(preds)
+
+
 class PyTorchLSTMClassifier:
     """
     Sklearn-style wrapper around _LSTMNet.
@@ -470,6 +781,10 @@ def main() -> None:
     parser.add_argument("--lstm-hidden",           type=int, default=64)
     parser.add_argument("--skip-lstm",             action="store_true",
                         help="Run Stages 1-3 only (faster for quick checks).")
+    parser.add_argument(
+    "--skip-stage5",
+    action="store_true"
+)
     args = parser.parse_args()
 
     # ── 1. Load data ──────────────────────────────────────────────────────────
@@ -523,33 +838,136 @@ def main() -> None:
             evaluate("stage_4_lstm", s4, x, y, snr, test_idx, n_classes)
         )
 
+    if not args.skip_stage5:
+
+        print(
+        f"\nTraining Stage 5 — ResNet + LSTM "
+        f"(hidden={args.lstm_hidden}, epochs={args.lstm_epochs}) ..."
+        )
+
+        s5 = ResNetLSTMClassifier(
+        hidden_size=args.lstm_hidden,
+        epochs=args.lstm_epochs,
+        seed=args.seed,
+        ).fit(
+        x[train_idx],
+        y[train_idx],
+        )
+
+        results.append(
+        evaluate(
+            "stage_5_resnet_lstm",
+            s5,
+            x,
+            y,
+            snr,
+            test_idx,
+            n_classes,
+        )
+        )
+
     # ── 6. Save & print results ───────────────────────────────────────────────
+
     reports_dir = Path("reports") / "numpy_mvp"
     reports_dir.mkdir(parents=True, exist_ok=True)
+
     output_path = reports_dir / "metrics.json"
+
     with open(output_path, "w", encoding="utf-8") as f:
-        json.dump({"labels": mods, "results": results}, f, indent=2)
+        json.dump(
+        {
+            "labels": mods,
+            "results": results,
+        },
+        f,
+        indent=2,
+        )
+
+# ─────────────────────────────────────────────
+#  Print overall test accuracy
+#
+#  Each stage is evaluated on exactly the
+#  same test set for fair comparison.
+# ─────────────────────────────────────────────
 
     print("\n" + "=" * 50)
     print("AMC MVP results")
     print("=" * 50)
-    for row in results:
-        print(f"  {row['model']:32s}  overall accuracy = {row['overall_accuracy']:.4f}")
 
-    # Print accuracy at high SNR (≥ 0 dB) for Stage 4 if available
-    if not args.skip_lstm:
-        lstm_result  = results[-1]
+    for row in results:
+
+        print(
+        f"  {row['model']:32s}"
+        f"  overall accuracy = "
+        f"{row['overall_accuracy']:.4f}"
+        )
+
+# ─────────────────────────────────────────────
+#  High-SNR analysis
+#
+#  Radio signals become much easier to
+#  classify when noise is low.
+#
+#  We therefore report average accuracy
+#  for SNR >= 0 dB.
+#
+#  This is often the metric reported in
+#  AMC literature.
+# ─────────────────────────────────────────────
+
+    print("\n" + "=" * 50)
+    print("High-SNR (>= 0 dB) Performance")
+    print("=" * 50)
+
+    for row in results:
+
+        if "accuracy_by_snr" not in row:
+            continue
+
         high_snr_acc = {
-            int(k): v for k, v in lstm_result["accuracy_by_snr"].items()
-            if int(k) >= 0
+        int(k): v
+        for k, v in row["accuracy_by_snr"].items()
+        if int(k) >= 0
         }
-        if high_snr_acc:
-            avg_high = np.mean(list(high_snr_acc.values()))
-            print(f"\n  LSTM avg accuracy at SNR ≥ 0 dB: {avg_high:.4f}  "
-                  f"(target ≥ 0.90)")
+
+        if len(high_snr_acc) == 0:
+            continue
+
+        avg_high = np.mean(
+        list(high_snr_acc.values())
+        )
+
+        print(
+        f"  {row['model']:32s}"
+        f"  avg_high_snr = "
+        f"{avg_high:.4f}"
+        )
+
+# ─────────────────────────────────────────────
+# Accuracy specifically at 18 dB
+# ─────────────────────────────────────────────
+
+    print("\n" + "=" * 50)
+    print("18 dB Accuracy")
+    print("=" * 50)
+
+    for row in results:
+
+        if "accuracy_by_snr" not in row:
+            continue
+
+        acc_18 = row["accuracy_by_snr"].get("18")
+
+        if acc_18 is None:
+            continue
+
+        print(
+        f"  {row['model']:32s}"
+        f"  acc@18dB = "
+        f"{acc_18:.4f}"
+        )
 
     print(f"\nFull metrics saved to {output_path}")
-
 
 if __name__ == "__main__":
     main()

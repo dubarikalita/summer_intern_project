@@ -25,11 +25,12 @@ The dataset contains:
 | **Stage 2** | Nearest Centroid | Classical ML | 22 strong features — amplitude, phase, differential phase, top FFT bins, cross-terms | Same model, much richer features |
 | **Stage 3** | Softmax Regression | Classical ML | Same 22 strong features as Stage 2 | Trainable linear classifier with L2 regularisation, 250 epochs |
 | **Stage 4** | LSTM (PyTorch) | Deep Learning | Raw I/Q signal — no feature engineering | 2-layer stacked LSTM, hidden size 128, dropout 0.5, Adam optimiser, 30 epochs |
+| **Stage 5** | ResNet + LSTM | Deep Learning | Raw I/Q signal | Conv1D stem + 3 residual blocks + 2-layer LSTM |
 
-**Key insight** — Stages 1–3 require you to manually extract features from the signal before classifying. Stage 4 (LSTM) takes the raw I/Q sequence directly and learns its own features automatically. This is the core advantage of deep learning for AMC.
+**Key insight** — Stages 1–3 require you to manually extract features from the signal before classifying. Stage 4 (LSTM) takes the raw I/Q sequence directly and learns its own features automatically. This is the core advantage of deep learning for AMC. stage 5 (LSTM+RESNET) ResNet extracts local signal features (phase shifts, amplitude changes, symbol patterns) before the LSTM models temporal dependencies; improves feature learning compared to Stage 4's pure LSTM
 
 **Target** — LSTM accuracy ≥ 90% at high SNR (≥ 0 dB), matching Ref [15] from the AMC research table.
-
+           — LSTM+RESNET accuracy ≥ 92% at 18db SNR, matching Ref [16] from the AMC research table.
 ---
 
 ## Running the Project
