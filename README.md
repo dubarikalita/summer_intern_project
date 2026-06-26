@@ -1,6 +1,6 @@
 # AMC MVP — Automatic Modulation Classification
 
-A deep learning based automatic modulation classification (AMC) system built on the RadioML2016.10a dataset. The project progressively improves from simple classical ML baselines up to an LSTM deep learning model, following the approach of Ref [15] from the AMC literature.
+A deep learning based Automatic Modulation Classification (AMC) system built on the RadioML2016.10a dataset. The project progressively improves from simple classical machine learning baselines to advanced deep learning architectures including LSTM, ResNet + LSTM, and the newly implemented Inception + ResNet model, following recent AMC research literature.
 
 ---
 
@@ -23,12 +23,23 @@ The dataset contains:
 |-------|-------|------|---------------|-------|
 | **Stage 1** | Nearest Centroid | Classical ML | 4 weak features — mean and std of I and Q channels | Simplest possible baseline |
 | **Stage 2** | Nearest Centroid | Classical ML | 22 strong features — amplitude, phase, differential phase, top FFT bins, cross-terms | Same model, much richer features |
-| **Stage 3** | Softmax Regression | Classical ML | Same 22 strong features as Stage 2 | Trainable linear classifier with L2 regularisation, 250 epochs |
-| **Stage 4** | LSTM (PyTorch) | Deep Learning | Raw I/Q signal — no feature engineering | 2-layer stacked LSTM, hidden size 128, dropout 0.5, Adam optimiser, 30 epochs |
+| **Stage 3** | Softmax Regression | Classical ML | Same 22 strong features as Stage 2 | Trainable linear classifier with L2 regularisation |
+| **Stage 4** | LSTM (PyTorch) | Deep Learning | Raw I/Q signal | 2-layer stacked LSTM |
+| **Stage 5** | ResNet + LSTM | Deep Learning | Raw I/Q signal | Conv1D stem + Residual Blocks + LSTM |
+| **Stage 6** | Inception + ResNet | Deep Learning | Raw I/Q signal | Multi-scale Inception blocks with residual learning |
 
-**Key insight** — Stages 1–3 require you to manually extract features from the signal before classifying. Stage 4 (LSTM) takes the raw I/Q sequence directly and learns its own features automatically. This is the core advantage of deep learning for AMC.
+**Key Insight**
 
-**Target** — LSTM accuracy ≥ 90% at high SNR (≥ 0 dB), matching Ref [15] from the AMC research table.
+- **Stages 1–3** rely on handcrafted signal features before classification.
+- **Stage 4 (LSTM)** automatically learns temporal features directly from raw I/Q sequences.
+- **Stage 5 (ResNet + LSTM)** improves feature extraction by combining convolutional residual learning with sequence modelling.
+- **Stage 6 (Inception + ResNet)** introduces multi-scale convolutional feature extraction using parallel kernels (1×1, 3×3, 5×5 and 7×7), allowing the network to capture modulation characteristics occurring at different temporal scales before residual refinement.
+
+**Target**
+
+- Stage 4 (LSTM): ≥90% accuracy at high SNR (Reference [15])
+- Stage 5 (ResNet + LSTM): ≥92% accuracy at high SNR (Reference [16])
+- Stage 6 (Inception + ResNet): Competitive high-SNR performance based on the architecture proposed in Reference [22]
 
 ---
 
@@ -57,7 +68,7 @@ Download `RML2016.10a_dict.pkl` from the Kaggle link above and place it inside t
 
 **Step 4 — Run**
 
-Full run — all 4 stages including LSTM (slow on CPU, ~30–50 min):
+Full run — all implemented stages including LSTM, ResNet + LSTM and Inception + ResNet(~40-50min).
 ```bash
 python -u mvp.py --dataset "./dataset/RML2016.10a_dict.pkl"
 ```
@@ -161,9 +172,18 @@ git push
 
 ---
 
+### Observations
+
+- Deep learning models significantly outperform classical machine learning baselines.
+- The LSTM achieved the highest overall classification accuracy on the RadioML2016.10a dataset.
+- The Inception + ResNet model demonstrated strong high-SNR performance (91.27% at 14 dB), validating the effectiveness of multi-scale convolutional feature extraction.
+- The lower overall accuracy is primarily due to reduced performance under low-SNR conditions, suggesting opportunities for further optimisation through hyperparameter tuning and architectural refinement.
+
+---
+
 ## Dependencies
 
 | Package | Purpose |
 |---------|---------|
 | `numpy` | Data generation, feature extraction, classical ML stages |
-| `torch` | PyTorch — LSTM model (Stage 4) |
+| `torch` | PyTorch — Deep Learning Models (Stages 4–6) |
