@@ -261,10 +261,27 @@ def _get_device() -> "torch.device":
 
 class _LSTMNet(nn.Module):
     """
-    Two-layer stacked LSTM followed by a linear classifier.
+    Two-layer stacked LSTM with mean-pooling + normalised classification head.
 
-    Input shape  : (batch, seq_len=128, features=2)
-    Output shape : (batch, n_classes)
+    Architecture
+    ------------
+    Input  : (B, 128, 2)              — raw I/Q sequence, batch-first
+    LSTM   : 2 layers, hidden_size, inter-layer dropout=0.3
+    Pool   : mean over all 128 time steps → (B, hidden_size)
+               Why mean-pool instead of last-step?
+               The final hidden state only carries what the LSTM chose to
+               remember at t=127. Mean-pooling aggregates evidence from every
+               time step, giving the classifier access to the full temporal
+               context — critical for modulations whose discriminative features
+               (e.g. phase jitter, envelope shape) are spread across the frame.
+    Norm   : LayerNorm stabilises the pooled vector before the FC layer,
+               preventing large-magnitude hidden states from dominating.
+    Head   : Dropout(0.4) → Linear(hidden → n_classes)
+               Dropout here regularises the classification layer independently
+               of the recurrent dropout, which only acts between LSTM layers.
+
+    Input shape  : (B, 128, 2)
+    Output shape : (B, n_classes)
     """
     def __init__(self, n_classes: int, hidden_size: int = 128) -> None:
         super().__init__()
@@ -273,15 +290,18 @@ class _LSTMNet(nn.Module):
             hidden_size = hidden_size,
             num_layers  = 2,
             batch_first = True,
-            dropout     = 0.5,      # dropout between the two LSTM layers
+            dropout     = 0.3,   # reduced: 0.5 → 0.3 (between LSTM layers only)
         )
-        self.fc = nn.Linear(hidden_size, n_classes)
+        self.norm    = nn.LayerNorm(hidden_size)
+        self.dropout = nn.Dropout(0.4)
+        self.fc      = nn.Linear(hidden_size, n_classes)
 
     def forward(self, x: "torch.Tensor") -> "torch.Tensor":
         # x : (B, 128, 2)
-        out, _ = self.lstm(x)       # out : (B, 128, hidden_size)
-        last   = out[:, -1, :]      # take the final time step : (B, hidden_size)
-        return self.fc(last)        # (B, n_classes)
+        out, _  = self.lstm(x)         # out : (B, 128, hidden_size)
+        pooled  = out.mean(dim=1)      # mean over all time steps → (B, hidden_size)
+        pooled  = self.norm(pooled)    # LayerNorm for stable FC input
+        return self.fc(self.dropout(pooled))   # (B, n_classes)
 
 
 class PyTorchLSTMClassifier:
@@ -289,25 +309,49 @@ class PyTorchLSTMClassifier:
     Sklearn-style wrapper around _LSTMNet.
     Exposes .fit(x, y) and .predict(x) so it plugs into
     the same evaluate() function used by Stages 1–3.
+
+    Key training choices
+    --------------------
+    - hidden_size=128 : matches the paper [15] capacity.
+    - CosineAnnealingLR : decays lr from 1e-3 to 1e-5 so the model
+        fine-tunes gently in later epochs instead of oscillating.
+    - grad_clip=1.0 : clips the global gradient norm before every
+        optimiser step.  LSTMs are notoriously prone to gradient
+        explosions; clipping prevents them without needing a lower lr.
     """
     def __init__(
         self,
-        hidden_size: int = 128,
-        epochs:      int = 30,
-        batch_size:  int = 256,
-        lr:         float = 1e-3,
-        seed:        int = 42,
+        hidden_size: int   = 128,   # was 64 in CLI default — corrected to match paper
+        epochs:      int   = 30,
+        batch_size:  int   = 256,
+        lr:          float = 1e-3,
+        grad_clip:   float = 1.0,   # max gradient norm; 0 = disabled
+        seed:        int   = 42,
     ) -> None:
         self.hidden_size = hidden_size
         self.epochs      = epochs
         self.batch_size  = batch_size
         self.lr          = lr
+        self.grad_clip   = grad_clip
         self.seed        = seed
 
-    def fit(self, x: np.ndarray, y: np.ndarray) -> "PyTorchLSTMClassifier":
+    def fit(
+        self,
+        x: np.ndarray,
+        y: np.ndarray,
+        x_val: Optional[np.ndarray] = None,
+        y_val: Optional[np.ndarray] = None,
+        checkpoint_path: Optional[str] = None,
+    ) -> "PyTorchLSTMClassifier":
         """
-        x : (N, 2, 128) — raw I/Q, already normalised
-        y : (N,)        — integer class labels
+        x / y         : training set  (N, 2, 128) / (N,)
+        x_val / y_val : optional validation set — when provided, a checkpoint
+                        is saved every time val accuracy improves.
+        checkpoint_path : where to write the .pt file; defaults to
+                          checkpoints/stage4_lstm_best.pt
+                          Saved dict contains model weights, optimiser state,
+                          best epoch, val_acc, n_classes, hidden_size — enough
+                          to fully restore or resume training later.
         """
         if not TORCH_AVAILABLE:
             raise RuntimeError(
@@ -320,21 +364,47 @@ class PyTorchLSTMClassifier:
         self.device_ = _get_device()
 
         # Reshape: (N, 2, 128) → (N, 128, 2)  — LSTM wants (batch, seq, features)
-        x_seq = torch.tensor(
-            x.transpose(0, 2, 1).astype(np.float32)
-        )
-        y_t = torch.tensor(y, dtype=torch.long)
+        x_seq = torch.tensor(x.transpose(0, 2, 1).astype(np.float32))
+        y_t   = torch.tensor(y, dtype=torch.long)
 
-        dataset    = TensorDataset(x_seq, y_t)
-        loader     = DataLoader(
-            dataset, batch_size=self.batch_size,
-            shuffle=True, num_workers=0, pin_memory=(self.device_.type == "cuda"),
+        loader = DataLoader(
+            TensorDataset(x_seq, y_t),
+            batch_size=self.batch_size,
+            shuffle=True, num_workers=0,
+            pin_memory=(self.device_.type == "cuda"),
         )
 
-        n_classes  = int(y.max()) + 1
+        # Optional validation tensors (kept on CPU; moved per-batch)
+        has_val = x_val is not None and y_val is not None
+        if has_val:
+            x_val_seq  = torch.tensor(x_val.transpose(0, 2, 1).astype(np.float32))
+            y_val_t    = torch.tensor(y_val, dtype=torch.long)
+            val_loader = DataLoader(
+                TensorDataset(x_val_seq, y_val_t),
+                batch_size=self.batch_size * 2, shuffle=False, num_workers=0,
+                pin_memory=(self.device_.type == "cuda"),
+            )
+
+        n_classes   = int(y.max()) + 1
         self.model_ = _LSTMNet(n_classes, self.hidden_size).to(self.device_)
         criterion   = nn.CrossEntropyLoss()
         optimizer   = torch.optim.Adam(self.model_.parameters(), lr=self.lr)
+        # CosineAnnealingLR: lr decays smoothly from self.lr → 1e-5 over all
+        # epochs.  Avoids the "stuck plateau" problem of a fixed learning rate
+        # and removes the need to hand-tune a step-decay schedule.
+        scheduler   = torch.optim.lr_scheduler.CosineAnnealingLR(
+            optimizer, T_max=self.epochs, eta_min=1e-5
+        )
+
+        # ── Checkpoint path ───────────────────────────────────────────────────
+        # We save whenever val accuracy strictly improves so we always keep
+        # the best-generalising weights, not just the final epoch's weights.
+        # At end of training the best checkpoint is reloaded automatically.
+        best_val_acc = -1.0
+        best_epoch   = 0
+        ckpt_path    = Path(checkpoint_path) if checkpoint_path else \
+                       Path("checkpoints") / "stage4_lstm_best.pt"
+        ckpt_path.parent.mkdir(parents=True, exist_ok=True)
 
         self.model_.train()
         for epoch in range(self.epochs):
@@ -343,23 +413,67 @@ class PyTorchLSTMClassifier:
             for xb, yb in loader:
                 xb = xb.to(self.device_)
                 yb = yb.to(self.device_)
-
                 optimizer.zero_grad()
                 logits = self.model_(xb)
                 loss   = criterion(logits, yb)
                 loss.backward()
+                # Gradient clipping: prevents LSTM exploding gradients.
+                # Clips the global L2 norm of all parameters to self.grad_clip.
+                if self.grad_clip > 0:
+                    nn.utils.clip_grad_norm_(self.model_.parameters(), self.grad_clip)
                 optimizer.step()
-
                 total_loss += loss.item() * len(yb)
                 correct    += (logits.argmax(1) == yb).sum().item()
                 total      += len(yb)
 
-            avg_loss = total_loss / total
-            acc      = correct / total
-            print(
+            scheduler.step()
+
+            log_msg = (
                 f"  LSTM epoch {epoch + 1:3d}/{self.epochs}"
-                f"  loss={avg_loss:.4f}  train_acc={acc:.4f}",
-                flush=True,
+                f"  loss={total_loss / total:.4f}"
+                f"  train_acc={correct / total:.4f}"
+                f"  lr={scheduler.get_last_lr()[0]:.2e}"
+            )
+
+            # ── Validation pass & checkpointing ───────────────────────────────
+            if has_val:
+                self.model_.eval()
+                val_correct, val_total = 0, 0
+                with torch.no_grad():
+                    for xb, yb in val_loader:
+                        xb = xb.to(self.device_)
+                        yb = yb.to(self.device_)
+                        val_correct += (self.model_(xb).argmax(1) == yb).sum().item()
+                        val_total   += len(yb)
+                val_acc  = val_correct / val_total
+                log_msg += f"  val_acc={val_acc:.4f}"
+
+                if val_acc > best_val_acc:
+                    best_val_acc = val_acc
+                    best_epoch   = epoch + 1
+                    torch.save(
+                        {
+                            "epoch":       best_epoch,
+                            "model_state": self.model_.state_dict(),
+                            "optim_state": optimizer.state_dict(),
+                            "val_acc":     best_val_acc,
+                            "n_classes":   n_classes,
+                            "hidden_size": self.hidden_size,
+                        },
+                        ckpt_path,
+                    )
+                    log_msg += "  ✓ saved"
+                self.model_.train()
+
+            print(log_msg, flush=True)
+
+        # ── Reload best weights ───────────────────────────────────────────────
+        if has_val and ckpt_path.exists():
+            saved = torch.load(ckpt_path, map_location=self.device_, weights_only=True)
+            self.model_.load_state_dict(saved["model_state"])
+            print(
+                f"  LSTM: restored best checkpoint  epoch={best_epoch}"
+                f"  val_acc={best_val_acc:.4f}  ← {ckpt_path}"
             )
 
         return self
@@ -385,15 +499,927 @@ NumpyLSTMClassifier = PyTorchLSTMClassifier
 
 
 # ─────────────────────────────────────────────
-#  SECTION 5 — DATA SPLITTING
+#  SECTION 5 — INCEPTION + RESNET MODEL (Stage 5)
+#
+#  Reference: [22] — "Modulation classification based on
+#  Inception network and ResNet"
+#  Dataset  : RadioML2016.10b
+#  Target   : ≥ 93.76% accuracy at 14 dB SNR
+#
+#  Motivation
+#  ----------
+#  Stage 4's plain LSTM reads the raw I/Q sequence one step
+#  at a time and misses local multi-scale structure — e.g.
+#  a narrow symbol pattern (kernel=3) and a wider inter-symbol
+#  pattern (kernel=7) are both present but a single Conv size
+#  can only see one at a time.
+#
+#  The Inception module solves this with PARALLEL branches of
+#  different kernel sizes, then concatenates their outputs so
+#  the next layer sees ALL scales at once.
+#  Residual skip connections then let the network deepen
+#  without vanishing gradients.
+#
+#  Architecture note
+#  -----------------
+#  The reference label "Inception Network + ResNet" typically describes an
+#  Inception-ResNet style where residual connections are integrated *inside*
+#  each Inception module.  Our implementation is a sequential arrangement of
+#  separate Inception and ResNet blocks — a simpler but effective variant.
+#  The blocks are now ALTERNATED (Inc → Res → Inc → Res) so that each
+#  residual block immediately refines the multi-scale features produced by
+#  its preceding Inception block, rather than stacking all Inception blocks
+#  first and all residual blocks second.
+#
+#  Full data flow
+#  --------------
+#  Input  (N, 2, 128)        — raw I/Q, channels-first for Conv1d
+#    ↓  Stem (2 convs)       — Conv→BN→ReLU→Conv→BN→ReLU; 2→64 channels
+#    ↓  InceptionBlock 1     — 4 parallel branches (k=1,3,5,7) → 256 ch
+#    ↓  ResidualBlock 1      — refine with skip connection (256 ch)
+#    ↓  InceptionBlock 2     — 4 parallel branches (k=1,3,5,7) → 256 ch
+#    ↓  ResidualBlock 2      — refine with skip connection (256 ch)
+#    ↓  AdaptiveAvgPool1d(1) — collapse time dimension → (N, 256)
+#    ↓  Dropout(0.3)         — regularisation
+#    ↓  Linear FC            — 256 → n_classes logits
+#  Output (N, n_classes)
 # ─────────────────────────────────────────────
+
+
+class _InceptionBlock1D(nn.Module):
+    """
+    Inception block for 1-D I/Q signal sequences.
+
+    Four parallel branches with different receptive fields run
+    simultaneously on the same input, then their outputs are
+    concatenated along the channel dimension.
+
+    Why four branches?
+    - kernel=1 : acts like a channel mixer / pointwise feature
+                 recombination — zero temporal context but cheap.
+    - kernel=3 : captures short-range symbol-level patterns
+                 (e.g. phase transitions within one symbol).
+    - kernel=5 : intermediate scale — catches patterns that span
+                 a few symbols (e.g. amplitude/phase envelopes).
+    - kernel=7 : captures wider inter-symbol context
+                 (e.g. amplitude envelope, frequency drift).
+    The extra intermediate scale (kernel=5) gives the model an
+    additional receptive field and usually improves feature diversity.
+    Concatenating all four lets downstream layers see multi-scale
+    features simultaneously, which is the core Inception insight.
+
+    Input shape  : (N, in_channels, seq_len)
+    Output shape : (N, out_channels*4, seq_len)  — same seq_len via padding
+    """
+
+    def __init__(self, in_channels: int, out_channels: int) -> None:
+        super().__init__()
+
+        # Branch 1 — pointwise (kernel size 1, no padding needed)
+        self.branch_1 = nn.Sequential(
+            nn.Conv1d(in_channels, out_channels, kernel_size=1, bias=False),
+            nn.BatchNorm1d(out_channels),
+            nn.ReLU(),
+        )
+
+        # Branch 2 — short-range (kernel size 3, padding=1 → same length)
+        self.branch_3 = nn.Sequential(
+            nn.Conv1d(in_channels, out_channels, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm1d(out_channels),
+            nn.ReLU(),
+        )
+
+        # Branch 3 — intermediate-range (kernel size 5, padding=2 → same length)
+        self.branch_5 = nn.Sequential(
+            nn.Conv1d(in_channels, out_channels, kernel_size=5, padding=2, bias=False),
+            nn.BatchNorm1d(out_channels),
+            nn.ReLU(),
+        )
+
+        # Branch 4 — wide-range (kernel size 7, padding=3 → same length)
+        self.branch_7 = nn.Sequential(
+            nn.Conv1d(in_channels, out_channels, kernel_size=7, padding=3, bias=False),
+            nn.BatchNorm1d(out_channels),
+            nn.ReLU(),
+        )
+
+    def forward(self, x: "torch.Tensor") -> "torch.Tensor":
+        b1 = self.branch_1(x)   # (N, out_channels, seq_len)
+        b3 = self.branch_3(x)   # (N, out_channels, seq_len)
+        b5 = self.branch_5(x)   # (N, out_channels, seq_len)
+        b7 = self.branch_7(x)   # (N, out_channels, seq_len)
+        # Concatenate along channel axis → (N, out_channels*4, seq_len)
+        return torch.cat([b1, b3, b5, b7], dim=1)
+
+
+class _ResBlock1D(nn.Module):
+    """
+    1-D residual block — same design as Stage 5's ResidualBlock1D.
+    Kept as a private class here so Stage 5 and Stage 6 are fully
+    self-contained and the channel width can differ.
+
+    Structure:
+        x ──► Conv1d ──► BN ──► ReLU ──► Conv1d ──► BN ──► (+x) ──► ReLU
+
+    Input/output shape: (N, channels, seq_len) — unchanged.
+    """
+
+    def __init__(self, channels: int) -> None:
+        super().__init__()
+        self.conv1 = nn.Conv1d(channels, channels, kernel_size=3, padding=1, bias=False)
+        self.bn1   = nn.BatchNorm1d(channels)
+        self.conv2 = nn.Conv1d(channels, channels, kernel_size=3, padding=1, bias=False)
+        self.bn2   = nn.BatchNorm1d(channels)
+
+    def forward(self, x: "torch.Tensor") -> "torch.Tensor":
+        identity = x
+        out = torch.relu(self.bn1(self.conv1(x)))
+        out = self.bn2(self.conv2(out))
+        return torch.relu(out + identity)
+    
+
+
+
+
+
+class _InceptionResNet(nn.Module):
+    """
+    Hybrid Inception + ResNet classifier for raw I/Q signals.
+
+    Architecture: Stem → Inc → Res → Inc → Res → AvgPool → Dropout → FC
+
+    The blocks are ALTERNATED rather than grouped (all-Inc then all-Res).
+    This means each ResBlock immediately refines the multi-scale features
+    from the Inception block just before it, giving the network tighter
+    feedback between feature extraction and feature refinement.
+
+    Note: this is a sequential Inception+ResNet arrangement, not a true
+    Inception-ResNet where skip connections are wired inside each Inception
+    module.  The alternating layout is a practical middle ground — simpler
+    to implement and still significantly better than pure Inception or pure
+    ResNet alone.
+    """
+
+    def __init__(self, n_classes: int) -> None:
+        super().__init__()
+
+        # Stem: two conv layers for richer low-level feature extraction
+        # Conv→BN→ReLU→Conv→BN→ReLU  (both 2→64 then 64→64, same-padding)
+        self.stem = nn.Sequential(
+            nn.Conv1d(2,  64, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm1d(64),
+            nn.ReLU(),
+            nn.Conv1d(64, 64, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm1d(64),
+            nn.ReLU(),
+        )
+
+        # Two Inception blocks (4 branches each, out_channels=64 per branch).
+        # Each outputs out_channels*4 = 256 channels.
+        # Alternated with residual blocks: inc1 → res1 → inc2 → res2
+        self.inc1 = _InceptionBlock1D(in_channels=64,  out_channels=64)
+        self.res1 = _ResBlock1D(256)   # immediately refines inc1's features
+        self.inc2 = _InceptionBlock1D(in_channels=256, out_channels=64)
+        self.res2 = _ResBlock1D(256)   # immediately refines inc2's features
+
+        # Global average pooling collapses (N, 256, 128) → (N, 256)
+        self.pool = nn.AdaptiveAvgPool1d(1)
+
+        # Dropout reduced from 0.5 → 0.3 (less aggressive for RadioML2016)
+        self.dropout = nn.Dropout(0.3)
+        self.fc      = nn.Linear(256, n_classes)
+
+    def forward(self, x: "torch.Tensor") -> "torch.Tensor":
+        # x : (N, 2, 128)
+        x = self.stem(x)    # (N, 64,  128)
+        x = self.inc1(x)    # (N, 256, 128)  — multi-scale feature extraction
+        x = self.res1(x)    # (N, 256, 128)  — refine inc1's features
+        x = self.inc2(x)    # (N, 256, 128)  — second pass multi-scale
+        x = self.res2(x)    # (N, 256, 128)  — refine inc2's features
+        x = self.pool(x)    # (N, 256, 1)
+        x = x.squeeze(-1)   # (N, 256)
+        x = self.dropout(x)
+        return self.fc(x)   # (N, n_classes)
+
+
+def _augment_iq(xb: "torch.Tensor") -> "torch.Tensor":
+    """
+    Minimal, numerically safe augmentation: random phase rotation only.
+
+    Why only phase rotation?
+    ------------------------
+    Phase rotation (multiply complex signal by e^{jθ}) is the one
+    augmentation that is:
+      (a) guaranteed not to change the modulation class — all standard
+          modulations (PSK, QAM, FSK) are defined up to a global phase
+          offset, which the receiver's phase-lock loop corrects anyway.
+      (b) lossless — it is a unitary transform; signal energy and
+          structure are perfectly preserved.
+      (c) trivially correct in floating point — no FFT, no .real
+          truncation, no circular shift boundary effects.
+
+    The earlier implementation applied 4 transforms simultaneously
+    (FFT-based shift, amplitude scale, frequency ramp, phase rotation),
+    which caused two problems:
+      1. The FFT shift used `ifft(...).real`, zeroing the imaginary part
+         and producing physically wrong (non-complex-baseband) signals.
+      2. With p=0.5 each, ~94% of samples received at least one transform
+         every batch — the model trained almost entirely on distorted
+         signals and never converged (train_acc stalled at ~44%).
+
+    This version applies only phase rotation with p=0.5, which is
+    sufficient to prevent the model memorising absolute phase and
+    improves generalisation at no cost to signal fidelity.
+
+    Parameters
+    ----------
+    xb : (B, 2, 128) float32 tensor — I/Q batch, channels-first
+
+    Returns
+    -------
+    (B, 2, 128) float32 tensor — same shape and dtype
+    """
+    B, _, L = xb.shape
+    device  = xb.device
+
+    # Sample per-element: apply rotation with probability 0.5
+    do_rotate = torch.rand(B, device=device) < 0.5          # (B,)
+    theta     = torch.rand(B, device=device) * 2 * torch.pi # U(0, 2π)
+
+    cos_t = torch.where(do_rotate, torch.cos(theta), torch.ones(B,  device=device))  # (B,)
+    sin_t = torch.where(do_rotate, torch.sin(theta), torch.zeros(B, device=device))  # (B,)
+
+    # Rotate: I' = I·cos(θ) − Q·sin(θ),  Q' = I·sin(θ) + Q·cos(θ)
+    I = xb[:, 0, :]                                          # (B, L)
+    Q = xb[:, 1, :]                                          # (B, L)
+    cos_t = cos_t.unsqueeze(1)                               # (B, 1) for broadcasting
+    sin_t = sin_t.unsqueeze(1)
+
+    I_rot = I * cos_t - Q * sin_t
+    Q_rot = I * sin_t + Q * cos_t
+
+    return torch.stack([I_rot, Q_rot], dim=1)                # (B, 2, L)
+
+
+class InceptionResNetClassifier:
+    """
+    Sklearn-style wrapper around _InceptionResNet.
+
+    Exposes .fit(x, y) and .predict(x) so it plugs into the
+    same evaluate() function used by all previous stages.
+
+    Training details
+    ----------------
+    - Loss      : CrossEntropyLoss with label_smoothing=0.1
+                  Prevents overconfident predictions; acts as implicit
+                  regularisation and consistently improves generalisation
+                  on AMC tasks (same benefit as mixup, simpler to apply).
+    - Optimiser : Adam lr=1e-3, weight_decay=1e-4
+    - Warmup    : Linear LR warmup for the first `warmup_epochs` epochs
+                  (default 5).  Convolutional models with many branches
+                  are sensitive to the large initial gradients that hit
+                  when all branches compete with random weights.  Warmup
+                  ramps lr from lr/10 → lr smoothly so early updates
+                  are small and the branches co-adapt before the full
+                  learning rate kicks in.
+    - Scheduler : CosineAnnealingLR after warmup — decays lr to 1e-5
+    - Grad clip : 1.0 (same as LSTM Stage 4) — prevents rare exploding
+                  gradients when augmented samples have very large norms.
+    - Epochs    : 50 (increased from 30 — CNN models need more epochs
+                  than LSTMs to converge; the extra 20 cost little on GPU)
+    - Batch     : 512 (faster on T4 GPU without hurting performance)
+    """
+
+    def __init__(
+        self,
+        epochs:          int   = 50,
+        batch_size:      int   = 512,
+        lr:              float = 1e-3,
+        grad_clip:       float = 1.0,
+        warmup_epochs:   int   = 5,
+        label_smoothing: float = 0.1,
+        seed:            int   = 42,
+    ) -> None:
+        self.epochs          = epochs
+        self.batch_size      = batch_size
+        self.lr              = lr
+        self.grad_clip       = grad_clip
+        self.warmup_epochs   = warmup_epochs
+        self.label_smoothing = label_smoothing
+        self.seed            = seed
+
+    def fit(
+        self,
+        x: np.ndarray,
+        y: np.ndarray,
+        x_val: Optional[np.ndarray] = None,
+        y_val: Optional[np.ndarray] = None,
+        checkpoint_path: Optional[str] = None,
+    ) -> "InceptionResNetClassifier":
+        """
+        x / y         : training set  (N, 2, 128) / (N,)
+        x_val / y_val : optional validation set — when provided, a checkpoint
+                        is saved every time val accuracy improves.
+        checkpoint_path : where to write the .pt file; defaults to
+                          checkpoints/stage5_inception_resnet_best.pt
+                          Saved dict: model_state, optim_state, scheduler_state,
+                          best_epoch, val_acc, n_classes — fully restorable.
+        """
+        if not TORCH_AVAILABLE:
+            raise RuntimeError(
+                "PyTorch is not installed. Run:\n"
+                "  pip install torch\n"
+                "then re-run the script."
+            )
+
+        torch.manual_seed(self.seed)
+        self.device_ = _get_device()
+
+        # Input is already (N, 2, 128) — correct for Conv1d, no transpose needed
+        x_t = torch.tensor(x.astype(np.float32))
+        y_t = torch.tensor(y, dtype=torch.long)
+
+        loader = DataLoader(
+            TensorDataset(x_t, y_t),
+            batch_size=self.batch_size,
+            shuffle=True, num_workers=0,
+            pin_memory=(self.device_.type == "cuda"),
+        )
+
+        # Optional validation tensors
+        has_val = x_val is not None and y_val is not None
+        if has_val:
+            x_val_t    = torch.tensor(x_val.astype(np.float32))
+            y_val_t    = torch.tensor(y_val, dtype=torch.long)
+            val_loader = DataLoader(
+                TensorDataset(x_val_t, y_val_t),
+                batch_size=self.batch_size * 2, shuffle=False, num_workers=0,
+            )
+
+        n_classes   = int(y.max()) + 1
+        self.model_ = _InceptionResNet(n_classes).to(self.device_)
+        # Label smoothing: replaces hard 0/1 targets with (ε/K, …, 1-ε+ε/K, …, ε/K).
+        # Prevents the model assigning probability ~1 to the correct class at high
+        # SNR, which would leave no gradient signal for the low-SNR regime.
+        criterion   = nn.CrossEntropyLoss(label_smoothing=self.label_smoothing)
+        # weight_decay=1e-4 adds L2 regularisation to all parameters.
+        optimizer   = torch.optim.Adam(
+            self.model_.parameters(), lr=self.lr, weight_decay=1e-4
+        )
+
+        # Two-phase LR schedule:
+        #   Phase 1 (epochs 0..warmup_epochs-1): linear ramp lr/10 → lr
+        #   Phase 2 (epochs warmup_epochs..end): cosine decay lr → 1e-5
+        # LinearLR: start_factor=0.1 means initial_lr = lr * 0.1
+        warmup_sched = torch.optim.lr_scheduler.LinearLR(
+            optimizer,
+            start_factor = 0.1,
+            end_factor   = 1.0,
+            total_iters  = self.warmup_epochs,
+        )
+        cosine_sched = torch.optim.lr_scheduler.CosineAnnealingLR(
+            optimizer,
+            T_max   = max(1, self.epochs - self.warmup_epochs),
+            eta_min = 1e-5,
+        )
+        scheduler = torch.optim.lr_scheduler.SequentialLR(
+            optimizer,
+            schedulers  = [warmup_sched, cosine_sched],
+            milestones  = [self.warmup_epochs],
+        )
+
+        # ── Checkpoint path ───────────────────────────────────────────────────
+        best_val_acc = -1.0
+        best_epoch   = 0
+        ckpt_path    = Path(checkpoint_path) if checkpoint_path else \
+                       Path("checkpoints") / "stage5_inception_resnet_best.pt"
+        ckpt_path.parent.mkdir(parents=True, exist_ok=True)
+
+        self.model_.train()
+        for epoch in range(self.epochs):
+            total_loss, correct, total = 0.0, 0, 0
+
+            for xb, yb in loader:
+                xb = xb.to(self.device_)
+                yb = yb.to(self.device_)
+                # Data augmentation: applied only during training
+                xb = _augment_iq(xb)
+                optimizer.zero_grad()
+                logits = self.model_(xb)
+                loss   = criterion(logits, yb)
+                loss.backward()
+                # Gradient clipping: prevents rare exploding gradients from
+                # augmented batches with large signal norms.
+                if self.grad_clip > 0:
+                    nn.utils.clip_grad_norm_(self.model_.parameters(), self.grad_clip)
+                optimizer.step()
+                total_loss += loss.item() * len(yb)
+                correct    += (logits.argmax(1) == yb).sum().item()
+                total      += len(yb)
+
+            scheduler.step()
+
+            log_msg = (
+                f"  Inception+ResNet epoch {epoch + 1:3d}/{self.epochs}"
+                f"  loss={total_loss / total:.4f}"
+                f"  train_acc={correct / total:.4f}"
+                f"  lr={scheduler.get_last_lr()[0]:.6f}"
+            )
+
+            # ── Validation pass & checkpointing ───────────────────────────────
+            if has_val:
+                self.model_.eval()
+                val_correct, val_total = 0, 0
+                with torch.no_grad():
+                    for xb, yb in val_loader:
+                        xb = xb.to(self.device_)
+                        yb = yb.to(self.device_)
+                        val_correct += (self.model_(xb).argmax(1) == yb).sum().item()
+                        val_total   += len(yb)
+                val_acc  = val_correct / val_total
+                log_msg += f"  val_acc={val_acc:.4f}"
+
+                if val_acc > best_val_acc:
+                    best_val_acc = val_acc
+                    best_epoch   = epoch + 1
+                    torch.save(
+                        {
+                            "epoch":           best_epoch,
+                            "model_state":     self.model_.state_dict(),
+                            "optim_state":     optimizer.state_dict(),
+                            "scheduler_state": scheduler.state_dict(),
+                            "val_acc":         best_val_acc,
+                            "n_classes":       n_classes,
+                        },
+                        ckpt_path,
+                    )
+                    log_msg += "  ✓ saved"
+                self.model_.train()
+
+            print(log_msg, flush=True)
+
+        # ── Reload best weights ───────────────────────────────────────────────
+        if has_val and ckpt_path.exists():
+            saved = torch.load(ckpt_path, map_location=self.device_, weights_only=True)
+            self.model_.load_state_dict(saved["model_state"])
+            print(
+                f"  Inception+ResNet: restored best checkpoint  epoch={best_epoch}"
+                f"  val_acc={best_val_acc:.4f}  ← {ckpt_path}"
+            )
+
+        return self
+
+    def predict(self, x: np.ndarray) -> np.ndarray:
+        self.model_.eval()
+        x_t    = torch.tensor(x.astype(np.float32))
+        loader = DataLoader(
+            TensorDataset(x_t),
+            batch_size=self.batch_size * 2,
+            shuffle=False,
+            num_workers=0,
+        )
+        preds = []
+        with torch.no_grad():
+            for (xb,) in loader:
+                xb = xb.to(self.device_)
+                preds.append(self.model_(xb).argmax(1).cpu().numpy())
+        return np.concatenate(preds)
+
+
+
+# ─────────────────────────────────────────────
+#  SECTION 6 — GROUPED + SEPARABLE CNN MODEL (Stage 6)
+#
+#  Reference: "Deep Learning-Based Automatic
+#  Modulation Classification Using CNN with
+#  Grouped and Separable Convolutional Layers"
+#
+#  Motivation
+#  ----------
+#  Standard convolutions become computationally
+#  expensive as channel depth increases.
+#
+#  This architecture replaces standard Conv1D
+#  layers with:
+#
+#      • Grouped Convolution
+#      • Depthwise Separable Convolution
+#
+#  to reduce parameters and FLOPs while
+#  maintaining high classification accuracy.
+# ─────────────────────────────────────────────
+
+class _GroupedConvBlock(nn.Module):
+    """
+    Grouped convolution block for 1-D I/Q signal sequences.
+
+    Input shape  : (N, in_channels, seq_len)
+    Output shape : (N, out_channels, seq_len)  — same seq_len via padding
+    """
+
+    def __init__(self, in_channels: int, out_channels: int, groups: int) -> None:
+        super().__init__()
+        self.block = nn.Sequential(
+
+            nn.Conv1d(
+                in_channels=in_channels,
+                out_channels=out_channels,
+                kernel_size=3,
+                padding=1,
+                groups=groups,
+                bias=False,
+            ),
+
+            nn.BatchNorm1d(out_channels),
+
+            nn.ReLU(inplace=True),
+
+        )
+
+    def forward(self, x):
+        return self.block(x)
+
+
+class _DepthwiseSeparableBlock(nn.Module):
+
+    def __init__(
+        self,
+        in_channels: int,
+        out_channels: int,
+    ) -> None:
+
+        super().__init__()
+        self.depthwise = nn.Conv1d(
+            in_channels=in_channels,
+            out_channels=in_channels,
+            kernel_size=3,
+            padding=1,
+            groups=in_channels,
+            bias=False,
+        )
+        self.pointwise = nn.Conv1d(
+            in_channels=in_channels,
+            out_channels=out_channels,
+            kernel_size=1,
+            bias=False,
+        )
+
+        self.bn = nn.BatchNorm1d(out_channels)
+
+        self.relu = nn.ReLU(inplace=True)
+
+    def forward(self, x):
+
+        x = self.depthwise(x)
+
+        x = self.pointwise(x)
+
+        x = self.bn(x)
+
+        x = self.relu(x)
+
+        return x
+    
+
+
+    
+
+class _GroupedSeparableNet(nn.Module):
+
+    """
+    Grouped + Depthwise Separable CNN classifier.
+
+    Architecture:
+    Stem → Grouped → Depthwise → Res →
+           Grouped → Depthwise → Res →
+           AvgPool → Dropout → FC
+    """
+
+    def __init__(self, n_classes: int) -> None:
+
+        super().__init__()
+
+        self.stem = nn.Sequential(
+            nn.Conv1d(2, 64, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm1d(64),
+            nn.ReLU(),
+
+            nn.Conv1d(64, 64, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm1d(64),
+            nn.ReLU(),
+        )
+
+        self.group1 = _GroupedConvBlock(
+            in_channels=64,
+            out_channels=256,
+            groups=4,
+        )
+
+        self.depth1 = _DepthwiseSeparableBlock(
+            in_channels=256,
+            out_channels=256,
+        )
+
+        self.res1 = _ResBlock1D(256)
+
+        self.group2 = _GroupedConvBlock(
+            in_channels=256,
+            out_channels=256,
+            groups=4,
+        )
+
+        self.depth2 = _DepthwiseSeparableBlock(
+            in_channels=256,
+            out_channels=256,
+        )
+
+        self.res2 = _ResBlock1D(256)
+
+        self.pool = nn.AdaptiveAvgPool1d(1)
+        self.dropout = nn.Dropout(0.3)
+        self.fc = nn.Linear(256, n_classes)
+
+    def forward(self, x):
+
+        x = self.stem(x)
+        x = self.group1(x)
+        x = self.depth1(x)
+        x = self.res1(x)
+        x = self.group2(x)
+        x = self.depth2(x)
+        x = self.res2(x)
+        x = self.pool(x)
+        x = x.squeeze(-1)
+        x = self.dropout(x)
+        
+        return self.fc(x)
+    
+
+class GroupedSeparableClassifier:
+    """
+    Sklearn-style wrapper around _GroupedSeparableNet.
+
+    Exposes .fit(x, y) and .predict(x) so it plugs into the
+    same evaluate() function used by all previous stages.
+
+    Training details
+    ----------------
+    - Architecture:
+          Stem → Grouped Conv → Depthwise Separable → Residual →
+          Grouped Conv → Depthwise Separable → Residual →
+          Global Average Pool → Dropout → Fully Connected
+
+      Unlike the previous Inception+ResNet model, this network replaces
+      the multi-branch Inception feature extractor with lightweight
+      Grouped Convolution and Depthwise Separable Convolution blocks.
+      Residual refinement is retained using the existing ResNet blocks,
+      allowing a fair comparison where only the feature extraction
+      strategy changes.
+
+    - Loss      : CrossEntropyLoss with label_smoothing=0.1
+                  Prevents overconfident predictions and improves
+                  generalisation, particularly for low-SNR samples.
+
+    - Optimiser : Adam (lr=1e-3, weight_decay=1e-4)
+
+    - Warmup    : Linear learning-rate warmup for the first
+                  `warmup_epochs` epochs to stabilise early training.
+
+    - Scheduler : CosineAnnealingLR after warmup for smooth
+                  learning-rate decay.
+
+    - Grad clip : 1.0 to prevent occasional exploding gradients.
+
+    - Epochs    : 50
+
+    - Batch     : 512
+    """
+
+    def __init__(
+        self,
+        epochs:          int   = 50,
+        batch_size:      int   = 512,
+        lr:              float = 1e-3,
+        grad_clip:       float = 1.0,
+        warmup_epochs:   int   = 5,
+        label_smoothing: float = 0.1,
+        seed:            int   = 42,
+    ) -> None:
+        self.epochs          = epochs
+        self.batch_size      = batch_size
+        self.lr              = lr
+        self.grad_clip       = grad_clip
+        self.warmup_epochs   = warmup_epochs
+        self.label_smoothing = label_smoothing
+        self.seed            = seed
+
+    def fit(
+        self,
+        x: np.ndarray,
+        y: np.ndarray,
+        x_val: Optional[np.ndarray] = None,
+        y_val: Optional[np.ndarray] = None,
+        checkpoint_path: Optional[str] = None,
+    ) -> "GroupedSeparableClassifier":
+        """
+        x / y         : training set  (N, 2, 128) / (N,)
+        x_val / y_val : optional validation set — when provided, a checkpoint
+                        is saved every time val accuracy improves.
+        checkpoint_path : where to write the .pt file; defaults to
+                          checkpoints/stage6_grouped_separable_best.pt
+                          Saved dict: model_state, optim_state, scheduler_state,
+                          best_epoch, val_acc, n_classes — fully restorable.
+        """
+        if not TORCH_AVAILABLE:
+            raise RuntimeError(
+                "PyTorch is not installed. Run:\n"
+                "  pip install torch\n"
+                "then re-run the script."
+            )
+
+        torch.manual_seed(self.seed)
+        self.device_ = _get_device()
+
+        # Input is already (N, 2, 128) — correct for Conv1d, no transpose needed
+        x_t = torch.tensor(x.astype(np.float32))
+        y_t = torch.tensor(y, dtype=torch.long)
+
+        loader = DataLoader(
+            TensorDataset(x_t, y_t),
+            batch_size=self.batch_size,
+            shuffle=True, num_workers=0,
+            pin_memory=(self.device_.type == "cuda"),
+        )
+
+        # Optional validation tensors
+        has_val = x_val is not None and y_val is not None
+        if has_val:
+            x_val_t    = torch.tensor(x_val.astype(np.float32))
+            y_val_t    = torch.tensor(y_val, dtype=torch.long)
+            val_loader = DataLoader(
+                TensorDataset(x_val_t, y_val_t),
+                batch_size=self.batch_size * 2, shuffle=False, num_workers=0,
+            )
+
+        n_classes = int(y.max()) + 1
+        self.model_ = _GroupedSeparableNet(n_classes).to(self.device_)
+
+        print("\n" + "=" * 65)
+        print("Trainable Parameters by Layer")
+        print("=" * 65)
+
+        total_params = 0
+
+        for name, param in self.model_.named_parameters():
+            if param.requires_grad:
+                count = param.numel()
+                total_params += count
+                print(f"{name:45s} {count:>10,}")
+
+        print("=" * 65)
+        print(f"Total Trainable Parameters: {total_params:,}")
+        print("=" * 65)
+        criterion   = nn.CrossEntropyLoss(label_smoothing=self.label_smoothing)
+        # weight_decay=1e-4 adds L2 regularisation to all parameters.
+        optimizer   = torch.optim.Adam(
+            self.model_.parameters(), lr=self.lr, weight_decay=1e-4
+        )
+
+        # Two-phase LR schedule:
+        #   Phase 1 (epochs 0..warmup_epochs-1): linear ramp lr/10 → lr
+        #   Phase 2 (epochs warmup_epochs..end): cosine decay lr → 1e-5
+        # LinearLR: start_factor=0.1 means initial_lr = lr * 0.1
+        warmup_sched = torch.optim.lr_scheduler.LinearLR(
+            optimizer,
+            start_factor = 0.1,
+            end_factor   = 1.0,
+            total_iters  = self.warmup_epochs,
+        )
+        cosine_sched = torch.optim.lr_scheduler.CosineAnnealingLR(
+            optimizer,
+            T_max   = max(1, self.epochs - self.warmup_epochs),
+            eta_min = 1e-5,
+        )
+        scheduler = torch.optim.lr_scheduler.SequentialLR(
+            optimizer,
+            schedulers  = [warmup_sched, cosine_sched],
+            milestones  = [self.warmup_epochs],
+        )
+
+        # ── Checkpoint path ───────────────────────────────────────────────────
+        best_val_acc = -1.0
+        best_epoch   = 0
+        ckpt_path    = Path(checkpoint_path) if checkpoint_path else \
+                       Path("checkpoints") / "stage6_grouped_separable_best.pt"
+        ckpt_path.parent.mkdir(parents=True, exist_ok=True)
+
+        self.model_.train()
+        for epoch in range(self.epochs):
+            total_loss, correct, total = 0.0, 0, 0
+
+            for xb, yb in loader:
+                xb = xb.to(self.device_)
+                yb = yb.to(self.device_)
+                # Data augmentation: applied only during training
+                xb = _augment_iq(xb)
+                optimizer.zero_grad()
+                logits = self.model_(xb)
+                loss   = criterion(logits, yb)
+                loss.backward()
+                # Gradient clipping: prevents rare exploding gradients from
+                # augmented batches with large signal norms.
+                if self.grad_clip > 0:
+                    nn.utils.clip_grad_norm_(self.model_.parameters(), self.grad_clip)
+                optimizer.step()
+                total_loss += loss.item() * len(yb)
+                correct    += (logits.argmax(1) == yb).sum().item()
+                total      += len(yb)
+
+            scheduler.step()
+
+            log_msg = (
+                f"  Grouped+Separable epoch {epoch + 1:3d}/{self.epochs}"
+                f"  loss={total_loss / total:.4f}"
+                f"  train_acc={correct / total:.4f}"
+                f"  lr={scheduler.get_last_lr()[0]:.6f}"
+            )
+
+            # ── Validation pass & checkpointing ───────────────────────────────
+            if has_val:
+                self.model_.eval()
+                val_correct, val_total = 0, 0
+                with torch.no_grad():
+                    for xb, yb in val_loader:
+                        xb = xb.to(self.device_)
+                        yb = yb.to(self.device_)
+                        val_correct += (self.model_(xb).argmax(1) == yb).sum().item()
+                        val_total   += len(yb)
+                val_acc  = val_correct / val_total
+                log_msg += f"  val_acc={val_acc:.4f}"
+
+                if val_acc > best_val_acc:
+                    best_val_acc = val_acc
+                    best_epoch   = epoch + 1
+                    torch.save(
+                        {
+                            "epoch":           best_epoch,
+                            "model_state":     self.model_.state_dict(),
+                            "optim_state":     optimizer.state_dict(),
+                            "scheduler_state": scheduler.state_dict(),
+                            "val_acc":         best_val_acc,
+                            "n_classes":       n_classes,
+                        },
+                        ckpt_path,
+                    )
+                    log_msg += "  ✓ saved"
+                self.model_.train()
+
+            print(log_msg, flush=True)
+
+        # ── Reload best weights ───────────────────────────────────────────────
+        if has_val and ckpt_path.exists():
+            saved = torch.load(ckpt_path, map_location=self.device_, weights_only=True)
+            self.model_.load_state_dict(saved["model_state"])
+            print(
+                f"  Grouped+Separable: restored best checkpoint..."
+                f"  val_acc={best_val_acc:.4f}  ← {ckpt_path}"
+            )
+
+        return self
+
+    def predict(self, x: np.ndarray) -> np.ndarray:
+        self.model_.eval()
+        x_t    = torch.tensor(x.astype(np.float32))
+        loader = DataLoader(
+            TensorDataset(x_t),
+            batch_size=self.batch_size * 2,
+            shuffle=False,
+            num_workers=0,
+        )
+        preds = []
+        with torch.no_grad():
+            for (xb,) in loader:
+                xb = xb.to(self.device_)
+                preds.append(self.model_(xb).argmax(1).cpu().numpy())
+        return np.concatenate(preds)
+
+
+    
+
+# ─────────────────────────────────────────────
+#  SECTION 6 — DATA SPLITTING
+# ─────────────────────────────────────────────
+
+
 
 def stratified_split(
     y: np.ndarray, snr: np.ndarray, seed: int
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """
     Split indices 70 / 15 / 15 stratified by (class, SNR).
-    Unchanged from original code.
+    Returns (train_idx, val_idx, test_idx).
+    The val split is used by deep models for checkpointing;
+    final reported accuracy always uses the held-out test split.
     """
     rng = np.random.default_rng(seed)
     train_idx, val_idx, test_idx = [], [], []
@@ -410,7 +1436,7 @@ def stratified_split(
 
 
 # ─────────────────────────────────────────────
-#  SECTION 6 — EVALUATION HELPERS
+#  SECTION 7 — EVALUATION HELPERS
 # ─────────────────────────────────────────────
 
 def accuracy(y_true: np.ndarray, y_pred: np.ndarray) -> float:
@@ -451,15 +1477,21 @@ def evaluate(
 
 
 # ─────────────────────────────────────────────
-#  SECTION 7 — MAIN ENTRY POINT
+#  SECTION 8 — MAIN ENTRY POINT
 # ─────────────────────────────────────────────
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="AMC MVP — Stages 1-4")
+    parser = argparse.ArgumentParser(description="AMC MVP — Stages 1–6")
     parser.add_argument(
         "--dataset", type=str, default=None,
         help="Path to RML2016.10a_dict.pkl. "
              "If omitted, the synthetic generator is used instead.",
+    )
+    parser.add_argument(
+        "--grouped-epochs",
+        type=int,
+        default=50,
+        help="Training epochs for Stage 6 Grouped+Separable CNN (default: 50).",
     )
     parser.add_argument("--samples-per-class-snr", type=int, default=80,
                         help="Synthetic mode only: samples per (class, SNR) pair.")
@@ -467,10 +1499,21 @@ def main() -> None:
                         help="Synthetic mode only: I/Q frame length.")
     parser.add_argument("--seed",                  type=int, default=7)
     parser.add_argument("--lstm-epochs",           type=int, default=30)
-    parser.add_argument("--lstm-hidden",           type=int, default=64)
+    parser.add_argument("--lstm-hidden",           type=int, default=128,
+                        help="LSTM hidden size (default: 128, matching paper [15]).")
+    parser.add_argument("--inception-epochs",      type=int, default=50,
+                        help="Training epochs for Stage 5 Inception+ResNet (default: 50).")
     parser.add_argument("--skip-lstm",             action="store_true",
-                        help="Run Stages 1-3 only (faster for quick checks).")
+                        help="Skip Stage 4 LSTM (run Stages 1–3 and 5 only).")
+    parser.add_argument("--skip-stage5",           action="store_true",
+                        help="Skip Stage 5 Inception+ResNet.")
+    parser.add_argument("--skip-stage6",           action="store_true",
+                        help="Skip Stage 6 Grouped+Separable CNN.")
+    parser.add_argument("--checkpoint-dir",        type=str, default="checkpoints",
+                        help="Directory for model checkpoints (default: checkpoints/).")
     args = parser.parse_args()
+
+    ckpt_dir = Path(args.checkpoint_dir)
 
     # ── 1. Load data ──────────────────────────────────────────────────────────
     if args.dataset:
@@ -504,9 +1547,9 @@ def main() -> None:
     n_classes = len(mods)
 
     results = [
-        evaluate("stage_1_weak_baseline",      s1, weak,   y, snr, test_idx, n_classes),
-        evaluate("stage_2_better_features",     s2, strong, y, snr, test_idx, n_classes),
-        evaluate("stage_3_trainable_softmax",   s3, strong, y, snr, test_idx, n_classes),
+        evaluate("stage_1_weak_baseline",    s1, weak,   y, snr, test_idx, n_classes),
+        evaluate("stage_2_better_features",  s2, strong, y, snr, test_idx, n_classes),
+        evaluate("stage_3_trainable_softmax",s3, strong, y, snr, test_idx, n_classes),
     ]
 
     # ── 5. Train LSTM (Stage 4) ───────────────────────────────────────────────
@@ -517,38 +1560,112 @@ def main() -> None:
             hidden_size = args.lstm_hidden,
             epochs      = args.lstm_epochs,
             seed        = args.seed,
-        ).fit(x[train_idx], y[train_idx])
-
+        ).fit(
+            x[train_idx], y[train_idx],
+            x_val           = x[val_idx],
+            y_val           = y[val_idx],
+            checkpoint_path = str(ckpt_dir / "stage4_lstm_best.pt"),
+        )
         results.append(
             evaluate("stage_4_lstm", s4, x, y, snr, test_idx, n_classes)
         )
 
-    # ── 6. Save & print results ───────────────────────────────────────────────
+    # ── 6. Train Inception + ResNet (Stage 5) ────────────────────────────────
+    if not args.skip_stage5:
+        print(f"\nTraining Stage 5 — Inception+ResNet "
+              f"(epochs={args.inception_epochs}) ...")
+        s5 = InceptionResNetClassifier(
+            epochs = args.inception_epochs,
+            seed   = args.seed,
+        ).fit(
+            x[train_idx], y[train_idx],
+            x_val           = x[val_idx],
+            y_val           = y[val_idx],
+            checkpoint_path = str(ckpt_dir / "stage5_inception_resnet_best.pt"),
+        )
+        results.append(
+            evaluate("stage_5_inception_resnet", s5, x, y, snr, test_idx, n_classes)
+        )
+
+    # ── 7. Train Grouped + Separable CNN (Stage 6) ─────────────────────────
+    if not args.skip_stage6:
+        print(f"\nTraining Stage 6 — Grouped+Separable CNN "
+              f"(epochs={args.grouped_epochs}) ...")
+
+        s6 = GroupedSeparableClassifier(
+            epochs=args.grouped_epochs,
+            seed=args.seed,
+        ).fit(
+            x[train_idx], y[train_idx],
+            x_val=x[val_idx],
+            y_val=y[val_idx],
+            checkpoint_path=str(
+                ckpt_dir / "stage6_grouped_separable_best.pt"
+            ),
+        )
+
+        results.append(
+            evaluate(
+                "stage_6_grouped_separable",
+                s6,
+                x,
+                y,
+                snr,
+                test_idx,
+                n_classes,
+            )
+        )
+
+    # ── 8. Save & print results ───────────────────────────────────────────────
     reports_dir = Path("reports") / "numpy_mvp"
     reports_dir.mkdir(parents=True, exist_ok=True)
     output_path = reports_dir / "metrics.json"
     with open(output_path, "w", encoding="utf-8") as f:
         json.dump({"labels": mods, "results": results}, f, indent=2)
 
-    print("\n" + "=" * 50)
+    print("\n" + "=" * 60)
     print("AMC MVP results")
-    print("=" * 50)
+    print("=" * 60)
     for row in results:
-        print(f"  {row['model']:32s}  overall accuracy = {row['overall_accuracy']:.4f}")
+        print(f"  {row['model']:36s}  overall={row['overall_accuracy']:.4f}")
 
-    # Print accuracy at high SNR (≥ 0 dB) for Stage 4 if available
+    # Per-stage high-SNR summary for deep models
+    deep_stages = []
+
     if not args.skip_lstm:
-        lstm_result  = results[-1]
-        high_snr_acc = {
-            int(k): v for k, v in lstm_result["accuracy_by_snr"].items()
-            if int(k) >= 0
-        }
-        if high_snr_acc:
-            avg_high = np.mean(list(high_snr_acc.values()))
-            print(f"\n  LSTM avg accuracy at SNR ≥ 0 dB: {avg_high:.4f}  "
-                  f"(target ≥ 0.90)")
+        deep_stages.append(
+            ("Stage 4 LSTM", "stage_4_lstm", 0.90)
+        )
 
-    print(f"\nFull metrics saved to {output_path}")
+    if not args.skip_stage5:
+        deep_stages.append(
+            ("Stage 5 Inception+ResNet",
+            "stage_5_inception_resnet",
+            0.9376)
+        )
+
+    if not args.skip_stage6:
+        deep_stages.append(
+            ("Stage 6 Grouped+Separable",
+            "stage_6_grouped_separable",
+            0.94)      # temporary target
+        )
+
+    for label, key, target in deep_stages:
+        row = next((r for r in results if r["model"] == key), None)
+        if row is None:
+            continue
+        high_snr = {int(k): v for k, v in row["accuracy_by_snr"].items() if int(k) >= 0}
+        if high_snr:
+            avg_high = float(np.mean(list(high_snr.values())))
+            acc_14   = row["accuracy_by_snr"].get("14", float("nan"))
+            print(
+                f"\n  {label}: avg acc SNR≥0dB={avg_high:.4f}"
+                f"  acc@14dB={acc_14:.4f}  (target≥{target:.4f})"
+            )
+
+    print(f"\nCheckpoints : {ckpt_dir}/")
+    print(f"Full metrics: {output_path}")
 
 
 if __name__ == "__main__":
