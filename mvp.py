@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import copy
 import json
 import pickle
 from pathlib import Path
@@ -407,20 +408,21 @@ class _ResNetLSTMNet(nn.Module):
         self.stem = nn.Sequential(
             nn.Conv1d(
                 2,          # in_channels  : I and Q
-                64,         # out_channels : learned feature maps
+                128,        # out_channels : learned feature maps
                 kernel_size=3,
                 padding=1,  # same-padding preserves seq_len=128
                 bias=False,
             ),
-            nn.BatchNorm1d(64),
+            nn.BatchNorm1d(128),
             nn.ReLU(),
         )
 
-        self.res1 = ResidualBlock1D(64)
-        self.res2 = ResidualBlock1D(64)
-        self.res3 = ResidualBlock1D(64)
+        self.res1 = ResidualBlock1D(128)
+        self.res2 = ResidualBlock1D(128)
+        self.res3 = ResidualBlock1D(128)
+        self.dropout = nn.Dropout(0.3)
         self.lstm = nn.LSTM(
-            input_size=64,
+            input_size=128,
             hidden_size=hidden_size,
             num_layers=2,
             batch_first=True,
@@ -437,9 +439,10 @@ class _ResNetLSTMNet(nn.Module):
         # Three residual blocks refine the feature maps without changing
         # shape.  Each block's skip connection ensures gradients backprop
         # cleanly all the way to the stem.
-        x = self.res1(x)    # (N, 64, 128)
-        x = self.res2(x)    # (N, 64, 128)
-        x = self.res3(x)    # (N, 64, 128)
+        x = self.res1(x)    # (N, 128, 128)
+        x = self.res2(x)    # (N, 128, 128)
+        x = self.res3(x)    # (N, 128, 128)
+        x = self.dropout(x)
         x = x.permute(0, 2, 1)
         out, _ = self.lstm(x)
         last = out[:, -1, :]    # (N, hidden_size)
@@ -455,13 +458,22 @@ class ResNetLSTMClassifier:
 
     Training details
     ----------------
-    - Loss    : CrossEntropyLoss (softmax + NLL in one numerically
-                stable op)
-    - Optimiser: Adam with lr=1e-3 (adaptive per-parameter learning
-                rates; well suited to the mixed conv+LSTM parameter
-                landscape)
-    - Epochs  : 30 by default; early stopping not used here — keep it
-                simple for benchmarking
+    - Loss    : CrossEntropyLoss with label_smoothing=0.1 (softens the
+                target distribution to reduce overconfidence)
+    - Optimiser: AdamW with lr=1e-3, weight_decay=1e-4 (decoupled weight
+                decay regularises the mixed conv+LSTM parameter landscape
+                more cleanly than plain Adam)
+    - Scheduler: CosineAnnealingLR over the full run, stepped once per
+                epoch, so the learning rate decays smoothly to ~0
+    - Gradient clipping: max-norm 1.0, applied after backward() to keep
+                LSTM training stable
+    - Augmentation: light phase rotation, amplitude scaling, frequency
+                offset, and timing shift applied per training batch
+    - Checkpointing: if a validation set is supplied, the model is
+                evaluated after every epoch and the best-validation-
+                accuracy weights are restored before the classifier is
+                returned — this avoids handing back an overfit final
+                epoch
     - Batch size: 256 — large enough for stable BN statistics while
                 fitting comfortably in GPU memory
     """
@@ -480,7 +492,39 @@ class ResNetLSTMClassifier:
         self.lr = lr
         self.seed = seed
 
-    def fit(self, x, y):
+    @staticmethod
+    def _augment_batch(xb):
+        """
+        Apply light, physically-motivated augmentations directly to a
+        batch of raw I/Q tensors, shape (B, 2, 128).
+
+        - Small phase rotation   : rotates the I/Q constellation
+        - Small amplitude scaling: mimics minor gain variation
+        - Tiny frequency offset  : mimics carrier frequency drift
+        - Slight timing shift    : mimics imperfect symbol timing
+
+        These are applied every batch, only during training, so the
+        model sees slightly different views of each example each epoch.
+        """
+        b, _, seq_len = xb.shape
+
+        i, q = xb[:, 0, :], xb[:, 1, :]
+        z = torch.complex(i, q)
+
+        phase_offset = (torch.rand(b, 1, device=xb.device) - 0.5) * 0.2
+        freq_offset  = (torch.rand(b, 1, device=xb.device) - 0.5) * 0.01
+        amp_scale    = 1.0 + (torch.rand(b, 1, device=xb.device) - 0.5) * 0.1
+
+        t = torch.arange(seq_len, device=xb.device, dtype=xb.dtype).unsqueeze(0)
+        z = z * torch.exp(1j * (phase_offset + 2 * np.pi * freq_offset * t))
+        z = z * amp_scale
+
+        shift = int(torch.randint(-3, 4, (1,)).item())
+        z = torch.roll(z, shifts=shift, dims=-1)
+
+        return torch.stack([z.real, z.imag], dim=1).to(xb.dtype)
+
+    def fit(self, x, y, x_val=None, y_val=None):
         torch.manual_seed(self.seed)
 
         self.device_ = _get_device()
@@ -507,16 +551,27 @@ class ResNetLSTMClassifier:
             hidden_size=self.hidden_size,
         ).to(self.device_)
 
-        criterion = nn.CrossEntropyLoss()
-
-        optimizer = torch.optim.Adam(
-            self.model_.parameters(),
-            lr=self.lr,
+        criterion = nn.CrossEntropyLoss(
+            label_smoothing=0.1
         )
 
-        self.model_.train()
+        optimizer = torch.optim.AdamW(
+            self.model_.parameters(),
+            lr=self.lr,
+            weight_decay=1e-4,
+        )
+
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+            optimizer,
+            T_max=self.epochs
+        )
+
+        best_val_acc = -1.0
+        best_state = None
 
         for epoch in range(self.epochs):
+
+            self.model_.train()
 
             total_loss = 0.0
             correct = 0
@@ -526,6 +581,8 @@ class ResNetLSTMClassifier:
 
                 xb = xb.to(self.device_)
                 yb = yb.to(self.device_)
+
+                xb = self._augment_batch(xb)
 
                 optimizer.zero_grad()
 
@@ -541,6 +598,11 @@ class ResNetLSTMClassifier:
                 # both the LSTM (via BPTT) and the conv blocks.
                 loss.backward()
 
+                torch.nn.utils.clip_grad_norm_(
+                    self.model_.parameters(),
+                    1.0
+                )
+
                 optimizer.step()
 
                 total_loss += loss.item() * len(yb)
@@ -551,14 +613,40 @@ class ResNetLSTMClassifier:
 
                 total += len(yb)
 
-            print(
+            scheduler.step()
+
+            log_line = (
                 f"  ResNet+LSTM epoch {epoch+1:3d}/{self.epochs}"
                 f"  loss={total_loss/total:.4f}"
-                f"  train_acc={correct/total:.4f}",
+                f"  train_acc={correct/total:.4f}"
+            )
+
+            if x_val is not None and y_val is not None:
+                val_acc = self._eval_accuracy(x_val, y_val)
+                log_line += f"  val_acc={val_acc:.4f}"
+
+                if val_acc > best_val_acc:
+                    best_val_acc = val_acc
+                    best_state = copy.deepcopy(self.model_.state_dict())
+
+            print(log_line, flush=True)
+
+        # Restore the best-validation checkpoint (if we tracked one)
+        # instead of just keeping the final epoch's weights.
+        if best_state is not None:
+            self.model_.load_state_dict(best_state)
+            print(
+                f"  Restored best checkpoint (val_acc={best_val_acc:.4f})",
                 flush=True,
             )
 
         return self
+
+    def _eval_accuracy(self, x, y):
+        """Quick validation-set accuracy check used for checkpointing."""
+        preds = self.predict(x)
+        self.model_.train()  # predict() leaves the model in eval mode
+        return float(np.mean(preds == y))
 
     def predict(self, x):
 
@@ -777,8 +865,8 @@ def main() -> None:
     parser.add_argument("--sequence-length",       type=int, default=128,
                         help="Synthetic mode only: I/Q frame length.")
     parser.add_argument("--seed",                  type=int, default=7)
-    parser.add_argument("--lstm-epochs",           type=int, default=30)
-    parser.add_argument("--lstm-hidden",           type=int, default=64)
+    parser.add_argument("--lstm-epochs",           type=int, default=50)
+    parser.add_argument("--lstm-hidden",           type=int, default=128)
     parser.add_argument("--skip-lstm",             action="store_true",
                         help="Run Stages 1-3 only (faster for quick checks).")
     parser.add_argument(
@@ -852,6 +940,8 @@ def main() -> None:
         ).fit(
         x[train_idx],
         y[train_idx],
+        x_val=x[val_idx],
+        y_val=y[val_idx],
         )
 
         results.append(
@@ -944,11 +1034,11 @@ def main() -> None:
         )
 
 # ─────────────────────────────────────────────
-# Accuracy specifically at 18 dB
+# Accuracy specifically at 14 dB
 # ─────────────────────────────────────────────
 
     print("\n" + "=" * 50)
-    print("18 dB Accuracy")
+    print("14 dB Accuracy")
     print("=" * 50)
 
     for row in results:
@@ -956,15 +1046,15 @@ def main() -> None:
         if "accuracy_by_snr" not in row:
             continue
 
-        acc_18 = row["accuracy_by_snr"].get("18")
+        acc_14 = row["accuracy_by_snr"].get("14")
 
-        if acc_18 is None:
+        if acc_14 is None:
             continue
 
         print(
         f"  {row['model']:32s}"
-        f"  acc@18dB = "
-        f"{acc_18:.4f}"
+        f"  acc@14dB = "
+        f"{acc_14:.4f}"
         )
 
     print(f"\nFull metrics saved to {output_path}")
