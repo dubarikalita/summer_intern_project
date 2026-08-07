@@ -526,22 +526,36 @@ NumpyLSTMClassifier = PyTorchLSTMClassifier
 #  Inception-ResNet style where residual connections are integrated *inside*
 #  each Inception module.  Our implementation is a sequential arrangement of
 #  separate Inception and ResNet blocks — a simpler but effective variant.
-#  The blocks are now ALTERNATED (Inc → Res → Inc → Res) so that each
-#  residual block immediately refines the multi-scale features produced by
-#  its preceding Inception block, rather than stacking all Inception blocks
-#  first and all residual blocks second.
+#  The blocks are ALTERNATED (Inc → Res → SE → Inc → Res → SE → ...) so that
+#  each residual block immediately refines the multi-scale features produced
+#  by its preceding Inception block, and each SE block reweights channels
+#  based on global context right after.
+#
+#  Widened + deepened (vs. the original 64-channel, 2-pair design):
+#    - Branch width 64 → 96 channels per branch (concat: 256 → 384 ch)
+#    - A third Inception+Residual+SE pair was added
+#    - GELU replaces ReLU throughout for smoother optimisation
+#    - Inception kernels widened from (1,3,5,7) to (1,3,7,11) for longer
+#      temporal context
+#    - Residual blocks support stochastic depth (randomly skipped during
+#      training) and SE (squeeze-and-excitation) channel attention
 #
 #  Full data flow
 #  --------------
 #  Input  (N, 2, 128)        — raw I/Q, channels-first for Conv1d
-#    ↓  Stem (2 convs)       — Conv→BN→ReLU→Conv→BN→ReLU; 2→64 channels
-#    ↓  InceptionBlock 1     — 4 parallel branches (k=1,3,5,7) → 256 ch
-#    ↓  ResidualBlock 1      — refine with skip connection (256 ch)
-#    ↓  InceptionBlock 2     — 4 parallel branches (k=1,3,5,7) → 256 ch
-#    ↓  ResidualBlock 2      — refine with skip connection (256 ch)
-#    ↓  AdaptiveAvgPool1d(1) — collapse time dimension → (N, 256)
-#    ↓  Dropout(0.3)         — regularisation
-#    ↓  Linear FC            — 256 → n_classes logits
+#    ↓  Stem (2 convs)       — Conv→BN→GELU→Conv→BN→GELU; 2→96→96 channels
+#    ↓  InceptionBlock 1     — 4 parallel branches (k=1,3,7,11) → 384 ch
+#    ↓  ResidualBlock 1      — refine with skip connection (384 ch)
+#    ↓  SEBlock 1            — channel attention (384 ch)
+#    ↓  InceptionBlock 2     — 4 parallel branches (k=1,3,7,11) → 384 ch
+#    ↓  ResidualBlock 2      — refine with skip connection (384 ch)
+#    ↓  SEBlock 2            — channel attention (384 ch)
+#    ↓  InceptionBlock 3     — 4 parallel branches (k=1,3,7,11) → 384 ch
+#    ↓  ResidualBlock 3      — refine with skip connection (384 ch)
+#    ↓  SEBlock 3            — channel attention (384 ch)
+#    ↓  AdaptiveAvgPool1d(1) — collapse time dimension → (N, 384)
+#    ↓  Dropout(0.4)         — regularisation
+#    ↓  Linear FC            — 384 → n_classes logits
 #  Output (N, n_classes)
 # ─────────────────────────────────────────────
 
@@ -555,16 +569,16 @@ class _InceptionBlock1D(nn.Module):
     concatenated along the channel dimension.
 
     Why four branches?
-    - kernel=1 : acts like a channel mixer / pointwise feature
-                 recombination — zero temporal context but cheap.
-    - kernel=3 : captures short-range symbol-level patterns
-                 (e.g. phase transitions within one symbol).
-    - kernel=5 : intermediate scale — catches patterns that span
-                 a few symbols (e.g. amplitude/phase envelopes).
-    - kernel=7 : captures wider inter-symbol context
-                 (e.g. amplitude envelope, frequency drift).
-    The extra intermediate scale (kernel=5) gives the model an
-    additional receptive field and usually improves feature diversity.
+    - kernel=1  : acts like a channel mixer / pointwise feature
+                  recombination — zero temporal context but cheap.
+    - kernel=3  : captures short-range symbol-level patterns
+                  (e.g. phase transitions within one symbol).
+    - kernel=7  : intermediate-to-wide scale — catches patterns that
+                  span several symbols (e.g. amplitude/phase envelopes).
+    - kernel=11 : captures the widest inter-symbol context
+                  (e.g. slow amplitude envelope, frequency drift) —
+                  widened from kernel=7 to reach longer temporal
+                  dependencies in the I/Q sequence.
     Concatenating all four lets downstream layers see multi-scale
     features simultaneously, which is the core Inception insight.
 
@@ -579,37 +593,37 @@ class _InceptionBlock1D(nn.Module):
         self.branch_1 = nn.Sequential(
             nn.Conv1d(in_channels, out_channels, kernel_size=1, bias=False),
             nn.BatchNorm1d(out_channels),
-            nn.ReLU(),
+            nn.GELU(),
         )
 
         # Branch 2 — short-range (kernel size 3, padding=1 → same length)
         self.branch_3 = nn.Sequential(
             nn.Conv1d(in_channels, out_channels, kernel_size=3, padding=1, bias=False),
             nn.BatchNorm1d(out_channels),
-            nn.ReLU(),
+            nn.GELU(),
         )
 
-        # Branch 3 — intermediate-range (kernel size 5, padding=2 → same length)
-        self.branch_5 = nn.Sequential(
-            nn.Conv1d(in_channels, out_channels, kernel_size=5, padding=2, bias=False),
-            nn.BatchNorm1d(out_channels),
-            nn.ReLU(),
-        )
-
-        # Branch 4 — wide-range (kernel size 7, padding=3 → same length)
+        # Branch 3 — wider-range (kernel size 7, padding=3 → same length)
         self.branch_7 = nn.Sequential(
             nn.Conv1d(in_channels, out_channels, kernel_size=7, padding=3, bias=False),
             nn.BatchNorm1d(out_channels),
-            nn.ReLU(),
+            nn.GELU(),
+        )
+
+        # Branch 4 — widest-range (kernel size 11, padding=5 → same length)
+        self.branch_11 = nn.Sequential(
+            nn.Conv1d(in_channels, out_channels, kernel_size=11, padding=5, bias=False),
+            nn.BatchNorm1d(out_channels),
+            nn.GELU(),
         )
 
     def forward(self, x: "torch.Tensor") -> "torch.Tensor":
-        b1 = self.branch_1(x)   # (N, out_channels, seq_len)
-        b3 = self.branch_3(x)   # (N, out_channels, seq_len)
-        b5 = self.branch_5(x)   # (N, out_channels, seq_len)
-        b7 = self.branch_7(x)   # (N, out_channels, seq_len)
+        b1  = self.branch_1(x)    # (N, out_channels, seq_len)
+        b3  = self.branch_3(x)    # (N, out_channels, seq_len)
+        b7  = self.branch_7(x)    # (N, out_channels, seq_len)
+        b11 = self.branch_11(x)   # (N, out_channels, seq_len)
         # Concatenate along channel axis → (N, out_channels*4, seq_len)
-        return torch.cat([b1, b3, b5, b7], dim=1)
+        return torch.cat([b1, b3, b7, b11], dim=1)
 
 
 class _ResBlock1D(nn.Module):
@@ -619,23 +633,64 @@ class _ResBlock1D(nn.Module):
     self-contained and the channel width can differ.
 
     Structure:
-        x ──► Conv1d ──► BN ──► ReLU ──► Conv1d ──► BN ──► (+x) ──► ReLU
+        x ──► Conv1d ──► BN ──► GELU ──► Conv1d ──► BN ──► (+x) ──► GELU
+
+    Stochastic depth: with probability `drop_prob` (training only), the
+    whole residual transform is skipped for the entire batch and the
+    block becomes an identity pass-through. This randomly shortens the
+    effective network depth during training, which acts as a strong
+    regulariser and is a common trick in modern ResNet variants.
 
     Input/output shape: (N, channels, seq_len) — unchanged.
     """
 
-    def __init__(self, channels: int) -> None:
+    def __init__(self, channels: int, drop_prob: float = 0.0) -> None:
         super().__init__()
-        self.conv1 = nn.Conv1d(channels, channels, kernel_size=3, padding=1, bias=False)
-        self.bn1   = nn.BatchNorm1d(channels)
-        self.conv2 = nn.Conv1d(channels, channels, kernel_size=3, padding=1, bias=False)
-        self.bn2   = nn.BatchNorm1d(channels)
+        self.conv1     = nn.Conv1d(channels, channels, kernel_size=3, padding=1, bias=False)
+        self.bn1       = nn.BatchNorm1d(channels)
+        self.conv2     = nn.Conv1d(channels, channels, kernel_size=3, padding=1, bias=False)
+        self.bn2       = nn.BatchNorm1d(channels)
+        self.act       = nn.GELU()
+        self.drop_prob = drop_prob
 
     def forward(self, x: "torch.Tensor") -> "torch.Tensor":
         identity = x
-        out = torch.relu(self.bn1(self.conv1(x)))
+        # Stochastic depth: randomly skip this block's transform during training.
+        if self.training and self.drop_prob > 0.0 and torch.rand(1).item() < self.drop_prob:
+            return identity
+        out = self.act(self.bn1(self.conv1(x)))
         out = self.bn2(self.conv2(out))
-        return torch.relu(out + identity)
+        return self.act(out + identity)
+
+
+class _SEBlock1D(nn.Module):
+    """
+    Squeeze-and-Excitation block for 1-D feature maps.
+
+    Squeezes the temporal dimension via global average pooling, learns a
+    small bottleneck MLP over channels, and rescales each channel of the
+    input by a learned [0, 1] gate. This lets the network emphasise the
+    most informative channels based on global (whole-sequence) context —
+    lightweight but effective, typically placed right after a residual
+    block so it reweights the refined features.
+
+    Input/output shape: (N, channels, seq_len) — unchanged.
+    """
+
+    def __init__(self, channels: int, reduction: int = 16) -> None:
+        super().__init__()
+        reduced   = max(1, channels // reduction)
+        self.pool = nn.AdaptiveAvgPool1d(1)
+        self.fc1  = nn.Linear(channels, reduced)
+        self.act  = nn.GELU()
+        self.fc2  = nn.Linear(reduced, channels)
+
+    def forward(self, x: "torch.Tensor") -> "torch.Tensor":
+        n, c, _ = x.shape
+        s = self.pool(x).view(n, c)          # (N, C) — global context
+        s = self.act(self.fc1(s))            # (N, C/reduction)
+        s = torch.sigmoid(self.fc2(s))       # (N, C) — per-channel gate
+        return x * s.view(n, c, 1)           # rescale channels
 
 
 class _InceptionResNet(nn.Module):
@@ -656,44 +711,62 @@ class _InceptionResNet(nn.Module):
     ResNet alone.
     """
 
-    def __init__(self, n_classes: int) -> None:
+    def __init__(self, n_classes: int, stochastic_depth_prob: float = 0.1) -> None:
         super().__init__()
 
+        # Width widened 64 → 96 channels per branch; concatenated Inception
+        # output is width*4 = 384 channels (was 256).
+        width           = 96
+        concat_channels = width * 4   # 384
+
         # Stem: two conv layers for richer low-level feature extraction
-        # Conv→BN→ReLU→Conv→BN→ReLU  (both 2→64 then 64→64, same-padding)
+        # Conv→BN→GELU→Conv→BN→GELU  (2→96 then 96→96, same-padding)
         self.stem = nn.Sequential(
-            nn.Conv1d(2,  64, kernel_size=3, padding=1, bias=False),
-            nn.BatchNorm1d(64),
-            nn.ReLU(),
-            nn.Conv1d(64, 64, kernel_size=3, padding=1, bias=False),
-            nn.BatchNorm1d(64),
-            nn.ReLU(),
+            nn.Conv1d(2,     width, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm1d(width),
+            nn.GELU(),
+            nn.Conv1d(width, width, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm1d(width),
+            nn.GELU(),
         )
 
-        # Two Inception blocks (4 branches each, out_channels=64 per branch).
-        # Each outputs out_channels*4 = 256 channels.
-        # Alternated with residual blocks: inc1 → res1 → inc2 → res2
-        self.inc1 = _InceptionBlock1D(in_channels=64,  out_channels=64)
-        self.res1 = _ResBlock1D(256)   # immediately refines inc1's features
-        self.inc2 = _InceptionBlock1D(in_channels=256, out_channels=64)
-        self.res2 = _ResBlock1D(256)   # immediately refines inc2's features
+        # Three Inception blocks (4 branches each, out_channels=width per branch).
+        # Each outputs width*4 = 384 channels.
+        # Alternated with residual + SE blocks:
+        #   inc1 → res1 → se1 → inc2 → res2 → se2 → inc3 → res3 → se3
+        self.inc1 = _InceptionBlock1D(in_channels=width,           out_channels=width)
+        self.res1 = _ResBlock1D(concat_channels, drop_prob=stochastic_depth_prob)
+        self.se1  = _SEBlock1D(concat_channels)
 
-        # Global average pooling collapses (N, 256, 128) → (N, 256)
+        self.inc2 = _InceptionBlock1D(in_channels=concat_channels, out_channels=width)
+        self.res2 = _ResBlock1D(concat_channels, drop_prob=stochastic_depth_prob)
+        self.se2  = _SEBlock1D(concat_channels)
+
+        self.inc3 = _InceptionBlock1D(in_channels=concat_channels, out_channels=width)
+        self.res3 = _ResBlock1D(concat_channels, drop_prob=stochastic_depth_prob)
+        self.se3  = _SEBlock1D(concat_channels)
+
+        # Global average pooling collapses (N, 384, 128) → (N, 384)
         self.pool = nn.AdaptiveAvgPool1d(1)
 
-        # Dropout reduced from 0.5 → 0.3 (less aggressive for RadioML2016)
-        self.dropout = nn.Dropout(0.3)
-        self.fc      = nn.Linear(256, n_classes)
+        # Dropout increased 0.3 → 0.4 alongside the wider/deeper network.
+        self.dropout = nn.Dropout(0.4)
+        self.fc      = nn.Linear(concat_channels, n_classes)
 
     def forward(self, x: "torch.Tensor") -> "torch.Tensor":
         # x : (N, 2, 128)
-        x = self.stem(x)    # (N, 64,  128)
-        x = self.inc1(x)    # (N, 256, 128)  — multi-scale feature extraction
-        x = self.res1(x)    # (N, 256, 128)  — refine inc1's features
-        x = self.inc2(x)    # (N, 256, 128)  — second pass multi-scale
-        x = self.res2(x)    # (N, 256, 128)  — refine inc2's features
-        x = self.pool(x)    # (N, 256, 1)
-        x = x.squeeze(-1)   # (N, 256)
+        x = self.stem(x)    # (N, 96,  128)
+        x = self.inc1(x)    # (N, 384, 128)  — multi-scale feature extraction
+        x = self.res1(x)    # (N, 384, 128)  — refine inc1's features
+        x = self.se1(x)     # (N, 384, 128)  — channel attention
+        x = self.inc2(x)    # (N, 384, 128)  — second pass multi-scale
+        x = self.res2(x)    # (N, 384, 128)  — refine inc2's features
+        x = self.se2(x)     # (N, 384, 128)  — channel attention
+        x = self.inc3(x)    # (N, 384, 128)  — third pass multi-scale
+        x = self.res3(x)    # (N, 384, 128)  — refine inc3's features
+        x = self.se3(x)     # (N, 384, 128)  — channel attention
+        x = self.pool(x)    # (N, 384, 1)
+        x = x.squeeze(-1)   # (N, 384)
         x = self.dropout(x)
         return self.fc(x)   # (N, n_classes)
 
@@ -757,6 +830,45 @@ def _augment_iq(xb: "torch.Tensor") -> "torch.Tensor":
     return torch.stack([I_rot, Q_rot], dim=1)                # (B, 2, L)
 
 
+def _mixup_batch(
+    xb: "torch.Tensor", yb: "torch.Tensor", alpha: float
+) -> tuple["torch.Tensor", "torch.Tensor", "torch.Tensor", float]:
+    """
+    Mixup augmentation (Zhang et al., 2018).
+
+    Blends each sample in the batch with a randomly-paired other sample:
+        x_mixed = λ·x_i + (1-λ)·x_j
+    and returns both label sets (y_i, y_j) plus the mixing coefficient λ,
+    so the caller can compute a mixed loss:
+        loss = λ·CE(logits, y_i) + (1-λ)·CE(logits, y_j)
+
+    λ is drawn from Beta(alpha, alpha) — with alpha≈0.2 this concentrates
+    mass near 0 or 1 (mostly one dominant sample, occasionally a stronger
+    blend), which works well for classification tasks and improves
+    robustness across the SNR range without distorting signal fidelity
+    as aggressively as blending at λ≈0.5 every time.
+
+    Parameters
+    ----------
+    xb    : (B, 2, L) float32 tensor — I/Q batch, channels-first
+    yb    : (B,) long tensor — class labels
+    alpha : Beta distribution shape parameter. alpha<=0 disables mixup.
+
+    Returns
+    -------
+    mixed_x : (B, 2, L) — mixed inputs
+    y_a     : (B,)      — original labels
+    y_b     : (B,)      — paired (shuffled) labels
+    lam     : float     — mixing coefficient λ
+    """
+    if alpha <= 0.0:
+        return xb, yb, yb, 1.0
+    lam = float(np.random.beta(alpha, alpha))
+    perm = torch.randperm(xb.size(0), device=xb.device)
+    mixed_x = lam * xb + (1.0 - lam) * xb[perm]
+    return mixed_x, yb, yb[perm], lam
+
+
 class InceptionResNetClassifier:
     """
     Sklearn-style wrapper around _InceptionResNet.
@@ -766,11 +878,15 @@ class InceptionResNetClassifier:
 
     Training details
     ----------------
-    - Loss      : CrossEntropyLoss with label_smoothing=0.1
-                  Prevents overconfident predictions; acts as implicit
-                  regularisation and consistently improves generalisation
-                  on AMC tasks (same benefit as mixup, simpler to apply).
-    - Optimiser : Adam lr=1e-3, weight_decay=1e-4
+    - Loss      : CrossEntropyLoss with label_smoothing=0.1, combined with
+                  mixup (see `mixup_alpha`) — both act as complementary
+                  regularisers: label smoothing softens the targets,
+                  mixup blends inputs and targets across samples for
+                  extra robustness across the SNR range.
+    - Optimiser : AdamW lr=1e-3, weight_decay=5e-4
+                  AdamW decouples weight decay from the gradient update
+                  (unlike Adam's L2-via-gradient coupling), which
+                  generally regularises CNNs more effectively.
     - Warmup    : Linear LR warmup for the first `warmup_epochs` epochs
                   (default 5).  Convolutional models with many branches
                   are sensitive to the large initial gradients that hit
@@ -781,23 +897,36 @@ class InceptionResNetClassifier:
     - Scheduler : CosineAnnealingLR after warmup — decays lr to 1e-5
     - Grad clip : 1.0 (same as LSTM Stage 4) — prevents rare exploding
                   gradients when augmented samples have very large norms.
-    - Epochs    : 50 (increased from 30 — CNN models need more epochs
-                  than LSTMs to converge; the extra 20 cost little on GPU)
+    - Epochs    : 50 (kept at 50 — pass --inception-epochs 80/100 to try
+                  longer training; since the best validation checkpoint is
+                  always restored, training longer carries relatively low
+                  risk of overfitting the final weights).
     - Batch     : 512 (faster on T4 GPU without hurting performance)
+    - Mixup     : alpha=0.2 (default) — blends random sample pairs each
+                  batch; set mixup_alpha=0.0 to disable.
+    - Stochastic depth : drop_prob=0.1 (default) per residual block —
+                  randomly skips a residual block's transform during
+                  training; set stochastic_depth_prob=0.0 to disable.
     """
 
     def __init__(
         self,
-        epochs:          int   = 50,
-        batch_size:      int   = 512,
-        lr:              float = 1e-3,
-        grad_clip:       float = 1.0,
-        warmup_epochs:   int   = 5,
-        label_smoothing: float = 0.1,
-        seed:            int   = 42,
+        epochs:                 int   = 50,
+        batch_size:             int   = 512,
+        lr:                     float = 1e-3,
+        weight_decay:           float = 5e-4,
+        grad_clip:              float = 1.0,
+        warmup_epochs:          int   = 5,
+        label_smoothing:        float = 0.1,
+        mixup_alpha:            float = 0.2,
+        stochastic_depth_prob:  float = 0.1,
+        seed:                   int   = 42,
     ) -> None:
-        self.epochs          = epochs
-        self.batch_size      = batch_size
+        self.epochs                = epochs
+        self.batch_size            = batch_size
+        self.weight_decay          = weight_decay
+        self.mixup_alpha           = mixup_alpha
+        self.stochastic_depth_prob = stochastic_depth_prob
         self.lr              = lr
         self.grad_clip       = grad_clip
         self.warmup_epochs   = warmup_epochs
@@ -853,14 +982,18 @@ class InceptionResNetClassifier:
             )
 
         n_classes   = int(y.max()) + 1
-        self.model_ = _InceptionResNet(n_classes).to(self.device_)
+        self.model_ = _InceptionResNet(
+            n_classes, stochastic_depth_prob=self.stochastic_depth_prob
+        ).to(self.device_)
         # Label smoothing: replaces hard 0/1 targets with (ε/K, …, 1-ε+ε/K, …, ε/K).
         # Prevents the model assigning probability ~1 to the correct class at high
         # SNR, which would leave no gradient signal for the low-SNR regime.
         criterion   = nn.CrossEntropyLoss(label_smoothing=self.label_smoothing)
-        # weight_decay=1e-4 adds L2 regularisation to all parameters.
-        optimizer   = torch.optim.Adam(
-            self.model_.parameters(), lr=self.lr, weight_decay=1e-4
+        # AdamW decouples weight decay from the gradient update (unlike Adam,
+        # where L2 regularisation is folded into the gradient) — generally
+        # works better for CNNs.
+        optimizer   = torch.optim.AdamW(
+            self.model_.parameters(), lr=self.lr, weight_decay=self.weight_decay
         )
 
         # Two-phase LR schedule:
@@ -900,9 +1033,13 @@ class InceptionResNetClassifier:
                 yb = yb.to(self.device_)
                 # Data augmentation: applied only during training
                 xb = _augment_iq(xb)
+                # Mixup: blends random sample pairs and their labels.
+                # y_a == yb when mixup_alpha<=0 (mixup disabled), so the
+                # loss and train_acc bookkeeping below stay correct either way.
+                xb, y_a, y_b, lam = _mixup_batch(xb, yb, self.mixup_alpha)
                 optimizer.zero_grad()
                 logits = self.model_(xb)
-                loss   = criterion(logits, yb)
+                loss   = lam * criterion(logits, y_a) + (1.0 - lam) * criterion(logits, y_b)
                 loss.backward()
                 # Gradient clipping: prevents rare exploding gradients from
                 # augmented batches with large signal norms.
